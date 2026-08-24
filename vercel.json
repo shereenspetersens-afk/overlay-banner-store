@@ -5,6 +5,12 @@
     },
     "pages/api/bundled-font-overlay.js": {
       "maxDuration": 30
+    },
+    "pages/api/reel.js": {
+      "maxDuration": 30
+    },
+    "pages/api/post-reel.js": {
+      "maxDuration": 300
     }
   }
 }
