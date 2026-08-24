@@ -54,51 +54,55 @@ function listMp4s(dirPath) {
     .filter((f) => /\.mp4$/i.test(f) && fs.statSync(path.join(dirPath, f)).isFile());
 }
 
-// When all files have been served, move everything from done/ back to the folder to restart the cycle
-function resetCycle(folderPath) {
-  const doneDir = path.join(folderPath, 'done');
-  if (!fs.existsSync(doneDir)) return;
-  const doneFiles = listMp4s(doneDir);
-  for (const f of doneFiles) {
-    const src = path.join(doneDir, f);
-    // Strip any _timestamp suffix added during moveToDone before restoring
-    const originalName = f.replace(/_\d{13}(\.mp4)$/i, '$1');
-    const dest = fs.existsSync(path.join(folderPath, originalName))
-      ? path.join(folderPath, `${path.parse(originalName).name}_restored_${Date.now()}.mp4`)
-      : path.join(folderPath, originalName);
-    fs.renameSync(src, dest);
+// ── /tmp state tracking (Vercel's filesystem is read-only; files cannot be moved) ──
+// State file lives in /tmp which is writable on Vercel serverless functions.
+// Caveat: /tmp is per-instance and resets on cold starts, which is acceptable for this use case.
+const TMP_STATE_DIR = '/tmp';
+
+function stateFilePath(folderName) {
+  return path.join(TMP_STATE_DIR, `reel_served_${folderName}.json`);
+}
+
+function loadServedSet(folderName) {
+  try {
+    const raw = fs.readFileSync(stateFilePath(folderName), 'utf8');
+    return new Set(JSON.parse(raw));
+  } catch {
+    return new Set();
   }
-  console.log(`🔄 Cycle reset: moved ${doneFiles.length} file(s) back from done/`);
 }
 
-// Pick a random mp4 from the folder; if empty, reset the cycle first
-function pickRandomMp4(folderPath) {
-  let files = listMp4s(folderPath);
-  if (files.length === 0) {
-    resetCycle(folderPath);
-    files = listMp4s(folderPath);
+function saveServedSet(folderName, servedSet) {
+  fs.writeFileSync(stateFilePath(folderName), JSON.stringify([...servedSet]));
+}
+
+function markAsServed(folderName, filename) {
+  const served = loadServedSet(folderName);
+  served.add(filename);
+  saveServedSet(folderName, served);
+  console.log(`✅ Marked as served: ${filename} (${served.size} total served)`);
+}
+
+// Pick a random unserved mp4; resets the cycle when all files have been served once
+function pickRandomMp4(folderPath, folderName) {
+  const allFiles = listMp4s(folderPath);
+  if (allFiles.length === 0) return null;
+
+  const served = loadServedSet(folderName);
+  let available = allFiles.filter((f) => !served.has(f));
+
+  if (available.length === 0) {
+    // All files have been served — reset the cycle
+    saveServedSet(folderName, new Set());
+    available = allFiles;
+    console.log(`🔄 Cycle reset: all ${allFiles.length} file(s) have been served, starting over`);
   }
-  if (files.length === 0) return null;
-  return files[Math.floor(Math.random() * files.length)];
+
+  return available[Math.floor(Math.random() * available.length)];
 }
 
-// Move a file to <folderPath>/done/, adding a timestamp suffix on name clash
-function moveToDone(filePath, folderPath) {
-  const doneDir = path.join(folderPath, 'done');
-  if (!fs.existsSync(doneDir)) fs.mkdirSync(doneDir, { recursive: true });
-
-  const name = path.basename(filePath);
-  const dest = fs.existsSync(path.join(doneDir, name))
-    ? path.join(doneDir, `${path.parse(name).name}_${Date.now()}.mp4`)
-    : path.join(doneDir, name);
-
-  fs.renameSync(filePath, dest);
-  console.log(`📁 Moved to done: ${path.basename(dest)}`);
-  return path.basename(dest);
-}
-
-// Stream a local mp4 file and move it to done/ when streaming ends
-function streamLocalFile(filePath, folderPath, res) {
+// Stream a local mp4 and mark it served once the response finishes
+function streamLocalFile(filePath, folderName, res) {
   return new Promise((resolve, reject) => {
     const stat = fs.statSync(filePath);
 
@@ -106,7 +110,7 @@ function streamLocalFile(filePath, folderPath, res) {
     res.setHeader('Content-Length', String(stat.size));
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'no-store'); // prevent caching; file will be gone after serve
+    res.setHeader('Cache-Control', 'no-store');
 
     const stream = fs.createReadStream(filePath);
     stream.pipe(res);
@@ -114,9 +118,9 @@ function streamLocalFile(filePath, folderPath, res) {
     stream.on('error', reject);
     res.on('finish', () => {
       try {
-        moveToDone(filePath, folderPath);
+        markAsServed(folderName, path.basename(filePath));
       } catch (err) {
-        console.error('❌ Failed to move file to done:', err.message);
+        console.error('❌ Failed to update served state:', err.message);
       }
       resolve();
     });
@@ -279,12 +283,11 @@ export default async function handler(req, res) {
           return res.status(400).json({ error: 'Invalid file name. Use alphanumeric characters and .mp4 extension.' });
         }
       } else {
-        // Random pick; resets cycle from done/ when all files have been served
-        targetFilename = pickRandomMp4(folderPath);
+        // Random pick; resets cycle in /tmp state when all files have been served
+        targetFilename = pickRandomMp4(folderPath, safeFolder);
         if (!targetFilename) {
           return res.status(404).json({
-            error: `No mp4 files found in public/resources/${safeFolder}/ or its done/ subfolder.`,
-            done_folder: `public/resources/${safeFolder}/done/`,
+            error: `No mp4 files found in public/resources/${safeFolder}/`,
           });
         }
       }
@@ -301,6 +304,8 @@ export default async function handler(req, res) {
       // ── JSON mode: return proxy URL + posting steps, don't serve yet ──────
       if (output === 'json') {
         const proxyUrl = buildSelfUrl(req, { folder: safeFolder, file: targetFilename });
+        const served = loadServedSet(safeFolder);
+        const total = listMp4s(folderPath).length;
 
         return res.status(200).json({
           success: true,
@@ -310,8 +315,9 @@ export default async function handler(req, res) {
           file_size_bytes: fs.statSync(filePath).size,
           proxy_video_url: proxyUrl,
           caption: caption || null,
-          note: 'Use proxy_video_url as video_url in the Instagram Graph API. The file is moved to done/ the moment Instagram downloads it via that URL.',
-          done_folder: `public/resources/${safeFolder}/done/`,
+          served_count: served.size,
+          total_files: total,
+          note: 'Use proxy_video_url as video_url in the Instagram Graph API. The file is marked served the moment Instagram downloads it via that URL.',
           instagram_requirements: IG_REEL_REQUIREMENTS,
           instagram_posting_steps: IG_POSTING_STEPS(proxyUrl, caption),
           permissions_required: ['instagram_basic', 'instagram_content_publish', 'pages_read_engagement'],
@@ -320,7 +326,7 @@ export default async function handler(req, res) {
 
       // ── Proxy/stream mode: serve file, then move to done/ ─────────────────
       console.log(`📂 Serving local file: public/resources/${safeFolder}/${targetFilename}`);
-      await streamLocalFile(filePath, folderPath, res);
+      await streamLocalFile(filePath, safeFolder, res);
       return;
     }
 
