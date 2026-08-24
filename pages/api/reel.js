@@ -47,16 +47,42 @@ function safePath(...parts) {
   return resolved;
 }
 
-// Return the first mp4 in a directory (alphabetical order)
-function pickNextMp4(dirPath) {
-  const files = fs
+// List mp4 files directly inside a directory (non-recursive)
+function listMp4s(dirPath) {
+  return fs
     .readdirSync(dirPath)
     .filter((f) => /\.mp4$/i.test(f) && fs.statSync(path.join(dirPath, f)).isFile());
-  files.sort();
-  return files[0] || null;
 }
 
-// Move a file to <folderPath>/done/, adding a timestamp suffix if a name clash exists
+// When all files have been served, move everything from done/ back to the folder to restart the cycle
+function resetCycle(folderPath) {
+  const doneDir = path.join(folderPath, 'done');
+  if (!fs.existsSync(doneDir)) return;
+  const doneFiles = listMp4s(doneDir);
+  for (const f of doneFiles) {
+    const src = path.join(doneDir, f);
+    // Strip any _timestamp suffix added during moveToDone before restoring
+    const originalName = f.replace(/_\d{13}(\.mp4)$/i, '$1');
+    const dest = fs.existsSync(path.join(folderPath, originalName))
+      ? path.join(folderPath, `${path.parse(originalName).name}_restored_${Date.now()}.mp4`)
+      : path.join(folderPath, originalName);
+    fs.renameSync(src, dest);
+  }
+  console.log(`🔄 Cycle reset: moved ${doneFiles.length} file(s) back from done/`);
+}
+
+// Pick a random mp4 from the folder; if empty, reset the cycle first
+function pickRandomMp4(folderPath) {
+  let files = listMp4s(folderPath);
+  if (files.length === 0) {
+    resetCycle(folderPath);
+    files = listMp4s(folderPath);
+  }
+  if (files.length === 0) return null;
+  return files[Math.floor(Math.random() * files.length)];
+}
+
+// Move a file to <folderPath>/done/, adding a timestamp suffix on name clash
 function moveToDone(filePath, folderPath) {
   const doneDir = path.join(folderPath, 'done');
   if (!fs.existsSync(doneDir)) fs.mkdirSync(doneDir, { recursive: true });
@@ -253,10 +279,11 @@ export default async function handler(req, res) {
           return res.status(400).json({ error: 'Invalid file name. Use alphanumeric characters and .mp4 extension.' });
         }
       } else {
-        targetFilename = pickNextMp4(folderPath);
+        // Random pick; resets cycle from done/ when all files have been served
+        targetFilename = pickRandomMp4(folderPath);
         if (!targetFilename) {
           return res.status(404).json({
-            error: `No mp4 files found in public/resources/${safeFolder}/`,
+            error: `No mp4 files found in public/resources/${safeFolder}/ or its done/ subfolder.`,
             done_folder: `public/resources/${safeFolder}/done/`,
           });
         }
