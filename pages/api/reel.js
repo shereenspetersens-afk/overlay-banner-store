@@ -307,19 +307,22 @@ export default async function handler(req, res) {
         const served = loadServedSet(safeFolder);
         const total = listMp4s(folderPath).length;
 
+        // caption_suggestion = filename without extension, underscores → spaces — ready to paste into Make
+        const captionSuggestion = path.parse(targetFilename).name.replace(/[_-]+/g, ' ');
+
         return res.status(200).json({
           success: true,
           source: 'local',
           folder: safeFolder,
           file: targetFilename,
+          caption_suggestion: caption || captionSuggestion,
           file_size_bytes: fs.statSync(filePath).size,
           proxy_video_url: proxyUrl,
-          caption: caption || null,
           served_count: served.size,
           total_files: total,
-          note: 'Use proxy_video_url as video_url in the Instagram Graph API. The file is marked served the moment Instagram downloads it via that URL.',
+          note: 'In Make: map proxy_video_url → Video URL, caption_suggestion → Caption.',
           instagram_requirements: IG_REEL_REQUIREMENTS,
-          instagram_posting_steps: IG_POSTING_STEPS(proxyUrl, caption),
+          instagram_posting_steps: IG_POSTING_STEPS(proxyUrl, caption || captionSuggestion),
           permissions_required: ['instagram_basic', 'instagram_content_publish', 'pages_read_engagement'],
         });
       }
