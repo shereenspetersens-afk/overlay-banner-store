@@ -88,6 +88,7 @@ export default function Feed() {
     <div style={{ minHeight: '100vh', background: '#0a0a0a', color: '#fff', fontFamily: "'Inter','Helvetica Neue',sans-serif" }}>
       <Head>
         <title>RSS Feed Viewer</title>
+        <meta name="robots" content="noindex, nofollow" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
