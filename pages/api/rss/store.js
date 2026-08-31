@@ -35,58 +35,64 @@ export default async function handler(req, res) {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // ── GET: return all stored items ──────────────────────────────────────────
-  if (req.method === 'GET') {
-    const items = await readIndex();
-    return res.status(200).json({ success: true, total: items.length, items });
-  }
-
-  // ── POST: store one item or a batch ──────────────────────────────────────
-  if (req.method === 'POST') {
-    if (!isAuthorized(req)) {
-      return res.status(401).json({ error: 'Unauthorized. Provide x-api-key header.' });
+  try {
+    // ── GET: return all stored items ────────────────────────────────────────
+    if (req.method === 'GET') {
+      const items = await readIndex();
+      return res.status(200).json({ success: true, total: items.length, items });
     }
 
-    let body;
-    try {
-      body = await parseJsonBody(req);
-    } catch (err) {
-      return res.status(400).json({ error: 'Could not parse request body as JSON', details: err.message });
-    }
-
-    // Accept either a single object or an array for batch inserts
-    const inputs = Array.isArray(body) ? body : [body];
-
-    if (inputs.length === 0) {
-      return res.status(400).json({ error: 'Body must be a non-empty object or array.' });
-    }
-
-    // Validate all entries before writing anything
-    for (const [i, entry] of inputs.entries()) {
-      if (!entry.imageUrl || !entry.title) {
-        return res.status(400).json({
-          error: `Item at index ${i} is missing required fields`,
-          required: ['imageUrl', 'title'],
-          optional: ['description', 'source'],
-        });
+    // ── POST: store one item or a batch ────────────────────────────────────
+    if (req.method === 'POST') {
+      if (!isAuthorized(req)) {
+        return res.status(401).json({ error: 'Unauthorized. Provide x-api-key header.' });
       }
-      try { new URL(entry.imageUrl); } catch {
-        return res.status(400).json({ error: `Item at index ${i} has an invalid imageUrl` });
+
+      let body;
+      try {
+        body = await parseJsonBody(req);
+      } catch (err) {
+        return res.status(400).json({ error: 'Could not parse request body as JSON', details: err.message });
       }
+
+      // Accept either a single object or an array for batch inserts
+      const inputs = Array.isArray(body) ? body : [body];
+
+      if (inputs.length === 0) {
+        return res.status(400).json({ error: 'Body must be a non-empty object or array.' });
+      }
+
+      // Validate all entries before writing anything
+      for (const [i, entry] of inputs.entries()) {
+        if (!entry.imageUrl || !entry.title) {
+          return res.status(400).json({
+            error: `Item at index ${i} is missing required fields`,
+            required: ['imageUrl', 'title'],
+            optional: ['description', 'source'],
+          });
+        }
+        try { new URL(entry.imageUrl); } catch {
+          return res.status(400).json({ error: `Item at index ${i} has an invalid imageUrl` });
+        }
+      }
+
+      // Build all items (image uploads run in parallel per batch)
+      const newItems = await Promise.all(inputs.map(storeOne));
+
+      // Prepend newest items first
+      const existing = await readIndex();
+      await writeIndex([...newItems, ...existing]);
+
+      if (newItems.length === 1) {
+        return res.status(201).json({ success: true, item: newItems[0] });
+      }
+      return res.status(201).json({ success: true, count: newItems.length, items: newItems });
     }
 
-    // Build all items (image uploads run in parallel per batch)
-    const newItems = await Promise.all(inputs.map(storeOne));
+    return res.status(405).json({ error: 'Method not allowed. Use GET or POST.' });
 
-    // Prepend newest items first
-    const existing = await readIndex();
-    await writeIndex([...newItems, ...existing]);
-
-    if (newItems.length === 1) {
-      return res.status(201).json({ success: true, item: newItems[0] });
-    }
-    return res.status(201).json({ success: true, count: newItems.length, items: newItems });
+  } catch (err) {
+    console.error('rss/store unhandled error:', err);
+    return res.status(500).json({ error: 'Internal server error', details: err.message });
   }
-
-  return res.status(405).json({ error: 'Method not allowed. Use GET or POST.' });
 }
