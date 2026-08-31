@@ -47,7 +47,12 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: 'Unauthorized. Provide x-api-key header.' });
     }
 
-    const body = await parseJsonBody(req);
+    let body;
+    try {
+      body = await parseJsonBody(req);
+    } catch (err) {
+      return res.status(400).json({ error: 'Could not parse request body as JSON', details: err.message });
+    }
 
     // Accept either a single object or an array for batch inserts
     const inputs = Array.isArray(body) ? body : [body];
