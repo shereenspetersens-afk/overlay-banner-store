@@ -3,88 +3,85 @@ import { parseJsonBody } from '../../../lib/parseBody';
 
 export const config = { api: { bodyParser: false } };
 
-/**
- * POST /api/rss/store
- *
- * Designed to be called from Make (Integromat) or any HTTP client.
- *
- * Headers:
- *   x-api-key: <RSS_STORE_SECRET env var>   (required if secret is set)
- *
- * Body (JSON):
- * {
- *   "imageUrl":    "https://example.com/image.jpg",  // required
- *   "title":       "Article title",                   // required
- *   "description": "Article description...",          // optional
- *   "source":      "my-feed-name"                     // optional, default: "default"
- * }
- *
- * Response 201:
- * { "success": true, "item": { id, source, title, description, imageUrl, originalImageUrl, storedAt } }
- */
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-  }
-
-  // Optional secret-key auth — set RSS_STORE_SECRET env var to enable
+// Auth helper — returns true when the request is allowed to proceed
+function isAuthorized(req) {
   const secret = process.env.RSS_STORE_SECRET;
-  if (secret) {
-    const provided = req.headers['x-api-key'] || req.query.secret;
-    if (!provided || provided !== secret) {
-      return res.status(401).json({ error: 'Unauthorized. Provide x-api-key header.' });
-    }
-  }
+  if (!secret) return true;
+  const provided = req.headers['x-api-key'] || req.query.secret;
+  return provided === secret;
+}
 
-  const { imageUrl, title, description = '', source = 'default' } = await parseJsonBody(req);
-
-  if (!imageUrl || !title) {
-    return res.status(400).json({
-      error: 'Missing required fields',
-      required: ['imageUrl', 'title'],
-      optional: ['description', 'source'],
-      example: {
-        imageUrl: 'https://example.com/image.jpg',
-        title: 'My Article',
-        description: 'Optional description',
-        source: 'my-rss-feed',
-      },
-    });
-  }
-
-  // Validate imageUrl is a real URL
-  try {
-    new URL(imageUrl);
-  } catch {
-    return res.status(400).json({ error: 'imageUrl is not a valid URL' });
-  }
-
-  // Sanitize source name to be safe for use as a folder path
+// Build and persist one item; returns the saved item object
+async function storeOne({ imageUrl, title, description = '', source = 'default' }) {
+  new URL(imageUrl); // throws if invalid
   const safeSrc = source.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
   const id = crypto.randomUUID();
-
-  // Download and persist image to Vercel Blob
   const storedImageUrl = await storeImage(imageUrl, safeSrc, id);
-
-  const item = {
+  return {
     id,
     source: safeSrc,
-    title: title.trim().slice(0, 500),
-    description: description.trim().slice(0, 5000),
-    imageUrl: storedImageUrl || imageUrl, // fallback to original URL if store failed
+    title: title.trim().slice(0, 1000),
+    description: description.trim().slice(0, 20000),
+    imageUrl: storedImageUrl || imageUrl,
     originalImageUrl: imageUrl,
     storedAt: new Date().toISOString(),
   };
+}
 
-  // Prepend to index so newest items appear first
-  const items = await readIndex();
-  items.unshift(item);
-  await writeIndex(items);
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
 
-  return res.status(201).json({ success: true, item });
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  // ── GET: return all stored items ──────────────────────────────────────────
+  if (req.method === 'GET') {
+    const items = await readIndex();
+    return res.status(200).json({ success: true, total: items.length, items });
+  }
+
+  // ── POST: store one item or a batch ──────────────────────────────────────
+  if (req.method === 'POST') {
+    if (!isAuthorized(req)) {
+      return res.status(401).json({ error: 'Unauthorized. Provide x-api-key header.' });
+    }
+
+    const body = await parseJsonBody(req);
+
+    // Accept either a single object or an array for batch inserts
+    const inputs = Array.isArray(body) ? body : [body];
+
+    if (inputs.length === 0) {
+      return res.status(400).json({ error: 'Body must be a non-empty object or array.' });
+    }
+
+    // Validate all entries before writing anything
+    for (const [i, entry] of inputs.entries()) {
+      if (!entry.imageUrl || !entry.title) {
+        return res.status(400).json({
+          error: `Item at index ${i} is missing required fields`,
+          required: ['imageUrl', 'title'],
+          optional: ['description', 'source'],
+        });
+      }
+      try { new URL(entry.imageUrl); } catch {
+        return res.status(400).json({ error: `Item at index ${i} has an invalid imageUrl` });
+      }
+    }
+
+    // Build all items (image uploads run in parallel per batch)
+    const newItems = await Promise.all(inputs.map(storeOne));
+
+    // Prepend newest items first
+    const existing = await readIndex();
+    await writeIndex([...newItems, ...existing]);
+
+    if (newItems.length === 1) {
+      return res.status(201).json({ success: true, item: newItems[0] });
+    }
+    return res.status(201).json({ success: true, count: newItems.length, items: newItems });
+  }
+
+  return res.status(405).json({ error: 'Method not allowed. Use GET or POST.' });
 }
