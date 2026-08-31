@@ -11,6 +11,15 @@
     },
     "pages/api/post-reel.js": {
       "maxDuration": 300
+    },
+    "pages/api/rss/store.js": {
+      "maxDuration": 30
+    },
+    "pages/api/rss/items.js": {
+      "maxDuration": 15
+    },
+    "pages/api/rss/item/[id].js": {
+      "maxDuration": 15
     }
   }
 }
