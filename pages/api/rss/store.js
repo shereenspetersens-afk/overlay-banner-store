@@ -1,7 +1,12 @@
 import { readIndex, writeIndex, storeImage } from '../../../lib/rssStore';
 import { parseJsonBody } from '../../../lib/parseBody';
 
-export const config = { api: { bodyParser: false } };
+export const config = {
+  api: {
+    bodyParser: false,
+    responseLimit: false,
+  },
+};
 
 // Auth helper — returns true when the request is allowed to proceed
 function isAuthorized(req) {
@@ -11,9 +16,18 @@ function isAuthorized(req) {
   return provided === secret;
 }
 
+const isDataUrl = (u) => typeof u === 'string' && /^data:image\/[a-z0-9.+-]+;base64,/i.test(u);
+
+function validateImageUrl(u) {
+  if (isDataUrl(u)) return true;
+  try { new URL(u); return true; } catch { return false; }
+}
+
 // Build and persist one item; returns the saved item object
 async function storeOne({ imageUrl, title, description = '', source = 'default' }) {
-  new URL(imageUrl); // throws if invalid
+  if (!validateImageUrl(imageUrl)) {
+    throw new Error('Invalid imageUrl');
+  }
   const safeSrc = source.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
   const id = crypto.randomUUID();
   const storedImageUrl = await storeImage(imageUrl, safeSrc, id);
@@ -22,8 +36,8 @@ async function storeOne({ imageUrl, title, description = '', source = 'default' 
     source: safeSrc,
     title: title.trim().slice(0, 1000),
     description: description.trim().slice(0, 20000),
-    imageUrl: storedImageUrl || imageUrl,
-    originalImageUrl: imageUrl,
+    imageUrl: storedImageUrl || (isDataUrl(imageUrl) ? null : imageUrl),
+    originalImageUrl: isDataUrl(imageUrl) ? null : imageUrl,
     storedAt: new Date().toISOString(),
   };
 }
@@ -71,7 +85,7 @@ export default async function handler(req, res) {
             optional: ['description', 'source'],
           });
         }
-        try { new URL(entry.imageUrl); } catch {
+        if (!validateImageUrl(entry.imageUrl)) {
           return res.status(400).json({ error: `Item at index ${i} has an invalid imageUrl` });
         }
       }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Head from 'next/head';
 
 const SOURCE_PALETTE = [
@@ -31,6 +31,31 @@ function Description({ text }) {
 }
 
 const LIMIT = 24;
+const KEY_STORAGE = 'rssStoreAdminKey';
+const ACCEPT_MIME = 'image/png,image/jpeg,image/jpg,image/webp,image/gif';
+const MAX_FILE_BYTES = 4 * 1024 * 1024; // stay under Vercel body-size ceiling
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload  = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+function sanitizeSource(s) {
+  return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
+}
+
+function guessTitleFromFile(name) {
+  return name
+    .replace(/\.[^.]+$/, '')
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 export default function Feed() {
   const [allSources, setAllSources]   = useState([]);
@@ -42,6 +67,31 @@ export default function Feed() {
   const [loading, setLoading]         = useState(true);
   const [expanded, setExpanded]       = useState({});
   const searchRef                     = useRef();
+
+  // Admin auth key (persisted in localStorage)
+  const [apiKey, setApiKey]           = useState('');
+  const [showKeyInput, setShowKeyInput] = useState(false);
+
+  // Selection mode (for batch ops on already-stored items)
+  const [selectMode, setSelectMode]         = useState(false);
+  const [selected, setSelected]             = useState(new Set());
+  const [batchSource, setBatchSource]       = useState('');
+  const [batchTitlePrefix, setBatchTitlePrefix] = useState('');
+  const [batchTitleSuffix, setBatchTitleSuffix] = useState('');
+  const [batchDescription, setBatchDescription] = useState('');
+  const [batchBusy, setBatchBusy]           = useState(false);
+  const [batchStatus, setBatchStatus]       = useState(null);
+
+  // Upload staging
+  const [uploadOpen, setUploadOpen]     = useState(false);
+  const [staged, setStaged]             = useState([]);
+  const [stageBusy, setStageBusy]       = useState(false);
+  const [stageProgress, setStageProgress] = useState({ done: 0, total: 0, current: '' });
+  const [batchPrefix, setBatchPrefix]         = useState('');
+  const [batchSuffix, setBatchSuffix]         = useState('');
+  const [batchStageDesc, setBatchStageDesc]   = useState('');
+  const [batchStageSource, setBatchStageSource] = useState('');
+  const fileInputRef = useRef(null);
 
   // Fetch items whenever filters change
   const load = useCallback(async (src, q, pg) => {
@@ -59,8 +109,12 @@ export default function Feed() {
     }
   }, []);
 
-  // Bootstrap source list from a broad first fetch
+  // Bootstrap source list + restore admin key
   useEffect(() => {
+    try {
+      const saved = localStorage.getItem(KEY_STORAGE);
+      if (saved) setApiKey(saved);
+    } catch {}
     fetch('/api/rss/items?limit=100')
       .then(r => r.json())
       .then(data => {
@@ -69,6 +123,14 @@ export default function Feed() {
       });
     load('all', '', 1);
   }, [load]);
+
+  // Persist admin key
+  useEffect(() => {
+    try {
+      if (apiKey) localStorage.setItem(KEY_STORAGE, apiKey);
+      else        localStorage.removeItem(KEY_STORAGE);
+    } catch {}
+  }, [apiKey]);
 
   const changeSource = (src) => { setActiveSource(src); setPage(1); load(src, search, 1); };
   const changePage   = (pg)  => { setPage(pg);  load(activeSource, search, pg); window.scrollTo({ top: 0, behavior: 'smooth' }); };
@@ -83,6 +145,187 @@ export default function Feed() {
   };
 
   const toggle = (id) => setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
+
+  const authHeaders = useMemo(() => {
+    const h = { 'Content-Type': 'application/json' };
+    if (apiKey) h['x-api-key'] = apiKey;
+    return h;
+  }, [apiKey]);
+
+  // ── Upload staging ─────────────────────────────────────────────────────
+  const refreshAll = async () => {
+    const data = await fetch('/api/rss/items?limit=100').then(r => r.json()).catch(() => ({}));
+    if (data && data.items) {
+      const unique = [...new Set(data.items.map(i => i.source))].sort();
+      setAllSources(unique);
+    }
+  };
+
+  const addFiles = async (fileList) => {
+    const files = Array.from(fileList || []).filter(f => f && f.type && f.type.startsWith('image/'));
+    if (files.length === 0) return;
+    const oversized = files.filter(f => f.size > MAX_FILE_BYTES);
+    if (oversized.length) {
+      alert(`Skipping ${oversized.length} file(s) larger than 4 MB:\n${oversized.map(f => f.name).join('\n')}`);
+    }
+    const usable = files.filter(f => f.size <= MAX_FILE_BYTES);
+    const rows = await Promise.all(usable.map(async (f) => ({
+      key: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${f.name}`,
+      name: f.name,
+      dataUrl: await fileToDataUrl(f),
+      title: guessTitleFromFile(f.name),
+      description: '',
+      source: 'uploads',
+      size: f.size,
+    })));
+    setStaged(prev => [...rows, ...prev]);
+    if (!uploadOpen) setUploadOpen(true);
+  };
+
+  const onFilesPicked = (e) => { addFiles(e.target.files); e.target.value = ''; };
+  const onDropFiles   = (e) => { e.preventDefault(); addFiles(e.dataTransfer.files); };
+
+  const updateStaged = (key, patch) => setStaged(prev => prev.map(r => r.key === key ? { ...r, ...patch } : r));
+  const removeStaged = (key)         => setStaged(prev => prev.filter(r => r.key !== key));
+  const clearStaged  = ()            => setStaged([]);
+
+  const applyStageBatch = () => {
+    setStaged(prev => prev.map(r => {
+      const next = { ...r };
+      if (batchStageSource.trim()) next.source = batchStageSource.trim();
+      if (batchPrefix)             next.title  = batchPrefix + next.title;
+      if (batchSuffix)             next.title  = next.title + batchSuffix;
+      if (batchStageDesc)          next.description = batchStageDesc;
+      return next;
+    }));
+    setBatchPrefix('');
+    setBatchSuffix('');
+    setBatchStageDesc('');
+    setBatchStageSource('');
+  };
+
+  const saveStaged = async () => {
+    if (staged.length === 0) return;
+    const bad = staged.find(r => !r.title.trim());
+    if (bad) { alert(`Every item needs a title. Missing on: ${bad.name}`); return; }
+
+    setStageBusy(true);
+    setStageProgress({ done: 0, total: staged.length, current: staged[0].name });
+
+    let saved = 0;
+    let failed = 0;
+    const failures = [];
+
+    // Send one at a time to stay safely under Vercel's request body limit
+    for (let i = 0; i < staged.length; i++) {
+      const row = staged[i];
+      setStageProgress({ done: i, total: staged.length, current: row.name });
+      try {
+        const res = await fetch('/api/rss/store', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            imageUrl: row.dataUrl,
+            title: row.title.trim(),
+            description: row.description.trim(),
+            source: sanitizeSource(row.source || 'uploads'),
+          }),
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          failed++;
+          failures.push(`${row.name}: ${j.error || res.statusText}`);
+        } else {
+          saved++;
+        }
+      } catch (err) {
+        failed++;
+        failures.push(`${row.name}: ${err.message}`);
+      }
+    }
+
+    setStageBusy(false);
+    setStageProgress({ done: staged.length, total: staged.length, current: '' });
+
+    if (failed) {
+      alert(`Saved ${saved}. ${failed} failed:\n${failures.join('\n')}`);
+    } else {
+      setStaged([]);
+      setUploadOpen(false);
+    }
+
+    await refreshAll();
+    load(activeSource, search, 1);
+    setPage(1);
+  };
+
+  // ── Selection mode on existing items ────────────────────────────────────
+  const toggleSelect = (id) => setSelected(prev => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const selectAllOnPage = () => setSelected(new Set(items.map(i => i.id)));
+  const clearSelection  = () => setSelected(new Set());
+
+  const applyBatchToSelected = async () => {
+    if (selected.size === 0) return alert('Select at least one item first.');
+    if (!batchSource && !batchTitlePrefix && !batchTitleSuffix && !batchDescription) {
+      return alert('Set at least one batch field (source, title prefix/suffix, or description).');
+    }
+    setBatchBusy(true);
+    setBatchStatus(null);
+    try {
+      const patch = {};
+      if (batchSource)       patch.source = batchSource;
+      if (batchTitlePrefix)  patch.titlePrefix = batchTitlePrefix;
+      if (batchTitleSuffix)  patch.titleSuffix = batchTitleSuffix;
+      if (batchDescription)  patch.description = batchDescription;
+      const res = await fetch('/api/rss/batch', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ action: 'update', ids: [...selected], patch }),
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      setBatchStatus(`Updated ${j.updated} item(s).`);
+      setBatchSource('');
+      setBatchTitlePrefix('');
+      setBatchTitleSuffix('');
+      setBatchDescription('');
+      clearSelection();
+      await refreshAll();
+      load(activeSource, search, page);
+    } catch (err) {
+      setBatchStatus(`Error: ${err.message}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const deleteSelected = async () => {
+    if (selected.size === 0) return;
+    if (!confirm(`Delete ${selected.size} selected item(s)? This removes them and their stored images.`)) return;
+    setBatchBusy(true);
+    setBatchStatus(null);
+    try {
+      const res = await fetch('/api/rss/batch', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ action: 'delete', ids: [...selected] }),
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      setBatchStatus(`Deleted ${j.deleted} item(s).`);
+      clearSelection();
+      await refreshAll();
+      load(activeSource, search, page);
+    } catch (err) {
+      setBatchStatus(`Error: ${err.message}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
 
   return (
     <div style={{ minHeight: '100vh', background: '#0a0a0a', color: '#fff', fontFamily: "'Inter','Helvetica Neue',sans-serif" }}>
@@ -115,7 +358,222 @@ export default function Feed() {
             borderRadius: '8px', color: '#fff', fontSize: '0.85rem', outline: 'none',
           }}
         />
+        <button
+          onClick={() => setUploadOpen(v => !v)}
+          style={{
+            padding: '9px 14px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+            background: '#6366f1', color: '#fff', fontSize: '0.82rem', fontWeight: 600,
+          }}
+        >
+          {uploadOpen ? 'Close upload' : '+ Upload images'}
+        </button>
+        <button
+          onClick={() => { setSelectMode(v => !v); clearSelection(); }}
+          style={{
+            padding: '9px 14px', borderRadius: '8px', cursor: 'pointer',
+            border: '1px solid rgba(255,255,255,0.14)',
+            background: selectMode ? '#8b5cf6' : 'rgba(255,255,255,0.06)',
+            color: '#fff', fontSize: '0.82rem', fontWeight: 600,
+          }}
+        >
+          {selectMode ? 'Exit select' : 'Select items'}
+        </button>
+        <button
+          onClick={() => setShowKeyInput(v => !v)}
+          title="Admin key required for uploads / edits when RSS_STORE_SECRET is set"
+          style={{
+            padding: '9px 12px', borderRadius: '8px', cursor: 'pointer',
+            border: '1px solid rgba(255,255,255,0.14)',
+            background: apiKey ? 'rgba(16,185,129,0.15)' : 'rgba(255,255,255,0.06)',
+            color: apiKey ? '#10b981' : '#fff', fontSize: '0.82rem',
+          }}
+        >
+          🔑 {apiKey ? 'Key set' : 'Set key'}
+        </button>
       </header>
+
+      {showKeyInput && (
+        <div style={{
+          padding: '10px 28px', background: 'rgba(0,0,0,0.4)',
+          borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap',
+        }}>
+          <input
+            type="password"
+            placeholder="RSS_STORE_SECRET"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            style={{
+              flex: 1, minWidth: 220, maxWidth: 420, padding: '8px 12px',
+              background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)',
+              borderRadius: '6px', color: '#fff', fontSize: '0.82rem', outline: 'none',
+            }}
+          />
+          <span style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.4)' }}>
+            Stored locally in your browser. Sent as <code>x-api-key</code>.
+          </span>
+        </div>
+      )}
+
+      {/* ── Upload / staging panel ── */}
+      {uploadOpen && (
+        <section style={{
+          padding: '18px 28px', background: 'rgba(99,102,241,0.05)',
+          borderBottom: '1px solid rgba(99,102,241,0.2)',
+        }}>
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={onDropFiles}
+            onClick={() => fileInputRef.current?.click()}
+            style={{
+              border: '2px dashed rgba(255,255,255,0.2)', borderRadius: '10px',
+              padding: '22px', textAlign: 'center', cursor: 'pointer',
+              background: 'rgba(0,0,0,0.25)',
+            }}
+          >
+            <div style={{ fontSize: '0.9rem', fontWeight: 600, marginBottom: 4 }}>
+              Drop images here or click to pick files
+            </div>
+            <div style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.45)' }}>
+              PNG · JPG · WEBP · GIF — max 4 MB per file. You can edit each caption below before saving.
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept={ACCEPT_MIME}
+              onChange={onFilesPicked}
+              style={{ display: 'none' }}
+            />
+          </div>
+
+          {staged.length > 0 && (
+            <>
+              {/* Batch tools */}
+              <div style={{
+                marginTop: 14, padding: '12px 14px', borderRadius: 10,
+                background: 'rgba(0,0,0,0.35)', border: '1px solid rgba(255,255,255,0.08)',
+                display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10,
+                alignItems: 'end',
+              }}>
+                <BatchField label="Set source for all" placeholder="e.g. uploads-2026"
+                  value={batchStageSource} onChange={setBatchStageSource} />
+                <BatchField label="Prefix all titles" placeholder="🔥 "
+                  value={batchPrefix} onChange={setBatchPrefix} />
+                <BatchField label="Suffix all titles" placeholder=" — 2026"
+                  value={batchSuffix} onChange={setBatchSuffix} />
+                <BatchField label="Set description for all" placeholder="Uploaded on 2026-…"
+                  value={batchStageDesc} onChange={setBatchStageDesc} />
+                <button onClick={applyStageBatch} style={{
+                  padding: '9px 14px', borderRadius: 8, border: 'none',
+                  background: '#14b8a6', color: '#fff', fontWeight: 600, cursor: 'pointer', fontSize: '0.82rem',
+                }}>Apply batch to all ({staged.length})</button>
+              </div>
+
+              {/* Staged grid */}
+              <div style={{
+                marginTop: 14, display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 12,
+              }}>
+                {staged.map(row => (
+                  <div key={row.key} style={{
+                    background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.09)',
+                    borderRadius: 10, overflow: 'hidden', display: 'flex', flexDirection: 'column',
+                  }}>
+                    <div style={{ position: 'relative', aspectRatio: '16/9', background: '#111' }}>
+                      <img src={row.dataUrl} alt={row.name}
+                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                      <button onClick={() => removeStaged(row.key)} title="Remove"
+                        style={{
+                          position: 'absolute', top: 6, right: 6,
+                          width: 24, height: 24, borderRadius: '50%', border: 'none', cursor: 'pointer',
+                          background: 'rgba(0,0,0,0.7)', color: '#fff', fontSize: 14, lineHeight: 1,
+                        }}>×</button>
+                    </div>
+                    <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <StageInput label="Title" value={row.title}
+                        onChange={(v) => updateStaged(row.key, { title: v })} />
+                      <StageInput label="Source" value={row.source}
+                        onChange={(v) => updateStaged(row.key, { source: v })} />
+                      <StageTextarea label="Description" value={row.description}
+                        onChange={(v) => updateStaged(row.key, { description: v })} />
+                      <div style={{ fontSize: '0.68rem', color: 'rgba(255,255,255,0.3)' }}>
+                        {row.name} · {(row.size / 1024).toFixed(0)} KB
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Actions */}
+              <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+                <button onClick={saveStaged} disabled={stageBusy} style={{
+                  padding: '10px 18px', borderRadius: 8, border: 'none',
+                  background: stageBusy ? '#4b5563' : '#10b981', color: '#fff', fontWeight: 700,
+                  cursor: stageBusy ? 'not-allowed' : 'pointer', fontSize: '0.85rem',
+                }}>
+                  {stageBusy
+                    ? `Saving ${stageProgress.done}/${stageProgress.total}…`
+                    : `Save all (${staged.length})`}
+                </button>
+                <button onClick={clearStaged} disabled={stageBusy} style={{
+                  padding: '10px 14px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.14)',
+                  background: 'transparent', color: '#fff', fontSize: '0.82rem',
+                  cursor: stageBusy ? 'not-allowed' : 'pointer',
+                }}>Clear staged</button>
+                {stageBusy && stageProgress.current && (
+                  <span style={{ fontSize: '0.75rem', color: 'rgba(255,255,255,0.5)' }}>
+                    Uploading: {stageProgress.current}
+                  </span>
+                )}
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
+      {/* ── Select-mode batch bar ── */}
+      {selectMode && (
+        <section style={{
+          padding: '12px 28px', background: 'rgba(139,92,246,0.08)',
+          borderBottom: '1px solid rgba(139,92,246,0.3)',
+        }}>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+            <strong style={{ fontSize: '0.85rem' }}>
+              {selected.size} selected
+            </strong>
+            <button onClick={selectAllOnPage} style={miniBtn}>Select page</button>
+            <button onClick={clearSelection} style={miniBtn}>Clear</button>
+            <button onClick={deleteSelected} disabled={batchBusy || selected.size === 0} style={{
+              ...miniBtn, background: '#ef4444', borderColor: '#ef4444',
+              opacity: batchBusy || selected.size === 0 ? 0.5 : 1,
+            }}>Delete selected</button>
+            {batchStatus && (
+              <span style={{ fontSize: '0.78rem', color: 'rgba(255,255,255,0.7)' }}>{batchStatus}</span>
+            )}
+          </div>
+          <div style={{
+            display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10,
+            alignItems: 'end',
+          }}>
+            <BatchField label="Change source" placeholder="new-source"
+              value={batchSource} onChange={setBatchSource} />
+            <BatchField label="Prefix titles" placeholder="🔥 "
+              value={batchTitlePrefix} onChange={setBatchTitlePrefix} />
+            <BatchField label="Suffix titles" placeholder=" — updated"
+              value={batchTitleSuffix} onChange={setBatchTitleSuffix} />
+            <BatchField label="Replace description" placeholder="Leave blank to skip"
+              value={batchDescription} onChange={setBatchDescription} />
+            <button onClick={applyBatchToSelected} disabled={batchBusy || selected.size === 0} style={{
+              padding: '10px 14px', borderRadius: 8, border: 'none',
+              background: batchBusy ? '#4b5563' : '#8b5cf6', color: '#fff',
+              fontWeight: 700, cursor: batchBusy ? 'not-allowed' : 'pointer', fontSize: '0.82rem',
+              opacity: selected.size === 0 ? 0.6 : 1,
+            }}>
+              {batchBusy ? 'Applying…' : `Apply to ${selected.size}`}
+            </button>
+          </div>
+        </section>
+      )}
 
       {/* ── Source tabs ── */}
       <nav style={{
@@ -161,6 +619,7 @@ export default function Feed() {
             {items.map(item => {
               const color = sourceColor(item.source, allSources);
               const isExpanded = !!expanded[item.id];
+              const isChecked  = selected.has(item.id);
               const preview = item.description
                 ? item.description.replace(/\*\*/g, '').slice(0, 110) + (item.description.length > 110 ? '…' : '')
                 : '';
@@ -168,13 +627,14 @@ export default function Feed() {
               return (
                 <article key={item.id} style={{
                   background: 'rgba(255,255,255,0.04)',
-                  border: '1px solid rgba(255,255,255,0.09)',
+                  border: `1px solid ${isChecked ? '#8b5cf6' : 'rgba(255,255,255,0.09)'}`,
                   borderRadius: '12px', overflow: 'hidden',
                   display: 'flex', flexDirection: 'column',
                   transition: 'border-color 0.2s, box-shadow 0.2s',
+                  boxShadow: isChecked ? '0 0 0 2px rgba(139,92,246,0.4)' : 'none',
                 }}
-                  onMouseEnter={e => { e.currentTarget.style.borderColor = `${color}66`; e.currentTarget.style.boxShadow = `0 4px 24px rgba(0,0,0,0.4)`; }}
-                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.09)'; e.currentTarget.style.boxShadow = 'none'; }}
+                  onMouseEnter={e => { if (!isChecked) { e.currentTarget.style.borderColor = `${color}66`; e.currentTarget.style.boxShadow = `0 4px 24px rgba(0,0,0,0.4)`; } }}
+                  onMouseLeave={e => { if (!isChecked) { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.09)'; e.currentTarget.style.boxShadow = 'none'; } }}
                 >
                   {/* Image */}
                   <div style={{ position: 'relative', aspectRatio: '16/9', background: '#111', flexShrink: 0 }}>
@@ -196,6 +656,23 @@ export default function Feed() {
                     }}>
                       {item.source}
                     </span>
+                    {selectMode && (
+                      <label style={{
+                        position: 'absolute', top: 9, right: 9,
+                        width: 28, height: 28, borderRadius: '50%',
+                        background: isChecked ? '#8b5cf6' : 'rgba(0,0,0,0.65)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        cursor: 'pointer', border: '2px solid rgba(255,255,255,0.6)',
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => toggleSelect(item.id)}
+                          style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }}
+                        />
+                        {isChecked && <span style={{ color: '#fff', fontSize: 15, fontWeight: 800 }}>✓</span>}
+                      </label>
+                    )}
                   </div>
 
                   {/* Body */}
@@ -289,3 +766,66 @@ function pgBtn(disabled) {
     fontSize: '0.82rem',
   };
 }
+
+// ── Small reusable inputs for batch tools / staging ──────────────────────────
+function BatchField({ label, placeholder, value, onChange }) {
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.55)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+        {label}
+      </span>
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          padding: '8px 10px', borderRadius: 6,
+          background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)',
+          color: '#fff', fontSize: '0.82rem', outline: 'none',
+        }}
+      />
+    </label>
+  );
+}
+
+function StageInput({ label, value, onChange }) {
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <span style={{ fontSize: '0.66rem', color: 'rgba(255,255,255,0.5)' }}>{label}</span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          padding: '6px 8px', borderRadius: 5,
+          background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)',
+          color: '#fff', fontSize: '0.78rem', outline: 'none',
+        }}
+      />
+    </label>
+  );
+}
+
+function StageTextarea({ label, value, onChange }) {
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+      <span style={{ fontSize: '0.66rem', color: 'rgba(255,255,255,0.5)' }}>{label}</span>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        rows={2}
+        style={{
+          padding: '6px 8px', borderRadius: 5, resize: 'vertical',
+          background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)',
+          color: '#fff', fontSize: '0.78rem', outline: 'none', fontFamily: 'inherit',
+        }}
+      />
+    </label>
+  );
+}
+
+const miniBtn = {
+  padding: '6px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.14)',
+  background: 'rgba(255,255,255,0.06)', color: '#fff', fontSize: '0.78rem', cursor: 'pointer',
+};
