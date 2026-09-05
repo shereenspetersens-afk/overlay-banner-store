@@ -13,6 +13,18 @@ const isAuthorized = (req) => {
 const sanitizeSource = (s) =>
   String(s || '').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
 
+function parseList(value) {
+  if (value == null) return [];
+  const arr = Array.isArray(value) ? value : String(value).split(',');
+  return [...new Set(arr.map((s) => String(s).trim()).filter(Boolean))];
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const t = Date.parse(value);
+  return Number.isFinite(t) ? t : null;
+}
+
 /**
  * Apply the caption / source patch to a single item.
  * Supported patch fields (all optional):
@@ -69,7 +81,12 @@ function applyPatch(item, patch) {
  *   "action": "update" | "delete",       (default "update")
  *   "ids": ["...", "..."],               (required unless "all": true)
  *   "all": false,                        (optional — target all items)
- *   "source": "…",                       (optional — restrict to items with this source)
+ *   "source": "a" | "a,b" | ["a","b"],   (optional — restrict to matching sources)
+ *   "sources": ["a","b"],                (alias for "source")
+ *   "search": "text",                    (optional — full-text filter on title+description)
+ *   "used": true | false,                (optional — restrict by used flag)
+ *   "from": "ISO", "to": "ISO",          (optional — storedAt range)
+ *   "usedFrom": "ISO", "usedTo": "ISO",  (optional — usedAt range)
  *   "patch": { ... }                     (required for "update")
  * }
  */
@@ -99,6 +116,10 @@ export default async function handler(req, res) {
     ids,
     all = false,
     source: sourceFilter,
+    sources: sourcesFilter,
+    search,
+    used: usedFilter,
+    from, to, usedFrom, usedTo,
     patch,
   } = body || {};
 
@@ -108,11 +129,29 @@ export default async function handler(req, res) {
 
   const items = await readIndex();
 
-  const idSet = Array.isArray(ids) ? new Set(ids) : null;
+  const idSet     = Array.isArray(ids) ? new Set(ids) : null;
+  const sourceSet = new Set(parseList(sourcesFilter ?? sourceFilter));
+  const q         = typeof search === 'string' && search.trim() ? search.trim().toLowerCase() : null;
+  const fromMs    = parseDate(from);
+  const toRaw     = to && /^\d{4}-\d{2}-\d{2}$/.test(String(to)) ? `${to}T23:59:59.999Z` : to;
+  const toMs      = parseDate(toRaw);
+  const usedFromMs = parseDate(usedFrom);
+  const usedToRaw  = usedTo && /^\d{4}-\d{2}-\d{2}$/.test(String(usedTo)) ? `${usedTo}T23:59:59.999Z` : usedTo;
+  const usedToMs   = parseDate(usedToRaw);
+
   const matches = (item) => {
     if (idSet && !idSet.has(item.id)) return false;
     if (!idSet && !all) return false;
-    if (sourceFilter && item.source !== sourceFilter) return false;
+    if (sourceSet.size > 0 && !sourceSet.has(item.source)) return false;
+    if (typeof usedFilter === 'boolean' && !!item.used !== usedFilter) return false;
+    if (q) {
+      const hay = `${item.title || ''}\n${item.description || ''}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    if (fromMs != null && Date.parse(item.storedAt) < fromMs) return false;
+    if (toMs   != null && Date.parse(item.storedAt) > toMs)   return false;
+    if (usedFromMs != null && (!item.usedAt || Date.parse(item.usedAt) < usedFromMs)) return false;
+    if (usedToMs   != null && (!item.usedAt || Date.parse(item.usedAt) > usedToMs))   return false;
     return true;
   };
 

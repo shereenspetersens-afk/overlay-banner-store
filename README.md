@@ -398,9 +398,14 @@ Query parameters (all optional):
 
 | Param      | Description                                                  | Default |
 |------------|--------------------------------------------------------------|---------|
-| `source`   | Filter by source name (exact match, e.g. `uploads`)          | —       |
+| `source`   | Filter by source. Single (`uploads`) **or comma-separated (`uploads,curated`)** for multi-source. | —       |
+| `sources`  | Alias for `source` — accepts a comma-separated list.         | —       |
 | `search`   | Full-text search across `title` + `description`              | —       |
 | `used`     | `false` → unused only, `true` → used only                    | —       |
+| `from`     | Inclusive lower bound on `storedAt` (ISO or `YYYY-MM-DD`)    | —       |
+| `to`       | Inclusive upper bound on `storedAt` (ISO or `YYYY-MM-DD`, dates auto-extend to end-of-day) | —       |
+| `usedFrom` | Inclusive lower bound on `usedAt`                            | —       |
+| `usedTo`   | Inclusive upper bound on `usedAt`                            | —       |
 | `limit`    | Items per page (1–100)                                       | `20`    |
 | `page`     | Page number (1-indexed)                                      | `1`     |
 | `markUsed` | `true` → also flip returned items to `used=true` (write op). Requires `x-api-key` when `RSS_STORE_SECRET` is set. | —       |
@@ -473,6 +478,8 @@ curl "https://your-domain.com/api/rss/item/9d1a2c-…"
 
 Accepts a single object **or** an array. `imageUrl` may be an `http(s)://…` URL **or** a `data:image/…;base64,…` data URL (used by the `/feed` upload UI).
 
+Each entry may set either `source` (single string, comma-separated list, or `default`) or `sources` (array). When multiple sources are supplied the same image is stored **once per source** — one item is created per source, each with its own id and per-source blob folder (`resources/<source>/<id>.<ext>`).
+
 Single item, remote URL:
 ```bash
 curl -X POST "https://your-domain.com/api/rss/store" \
@@ -486,15 +493,28 @@ curl -X POST "https://your-domain.com/api/rss/store" \
   }'
 ```
 
-Batch (array):
+Multi-source (one POST → one item per source):
+```bash
+curl -X POST "https://your-domain.com/api/rss/store" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{
+    "imageUrl": "https://picsum.photos/800/600",
+    "title": "Cross-posted",
+    "sources": ["uploads", "curated-2026", "featured"]
+  }'
+# Response: { "success": true, "count": 3, "items": [...] }
+```
+
+Batch (array) — each entry may itself fan out to multiple sources:
 ```bash
 curl -X POST "https://your-domain.com/api/rss/store" \
   -H "Content-Type: application/json" \
   -H "x-api-key: $RSS_KEY" \
   -d '[
     { "imageUrl": "https://picsum.photos/800/600?a", "title": "One",   "source": "uploads" },
-    { "imageUrl": "https://picsum.photos/800/600?b", "title": "Two",   "source": "uploads" },
-    { "imageUrl": "https://picsum.photos/800/600?c", "title": "Three", "source": "uploads" }
+    { "imageUrl": "https://picsum.photos/800/600?b", "title": "Two",   "sources": ["uploads", "featured"] },
+    { "imageUrl": "https://picsum.photos/800/600?c", "title": "Three", "source": "uploads,curated" }
   ]'
 ```
 
@@ -511,7 +531,7 @@ await fetch('/api/rss/store', {
     imageUrl: dataUrl,               // data:image/png;base64,…
     title: 'Uploaded from browser',
     description: '',
-    source: 'uploads',
+    sources: ['uploads', 'curated'], // ← comma-separated string also accepted via `source`
   }),
 });
 ```
@@ -535,7 +555,14 @@ Body shape:
   "action": "update",
   "ids": ["id1", "id2"],
   "all": false,
-  "source": "optional-source-filter",
+  "source": "a" or "a,b" or ["a","b"],
+  "sources": ["a","b"],
+  "search": "optional text filter",
+  "used": true,
+  "from": "2026-01-01",
+  "to": "2026-06-30",
+  "usedFrom": "2026-05-01",
+  "usedTo": "2026-05-31",
   "patch": {
     "source": "new-source",
     "used": true,
@@ -553,7 +580,8 @@ Body shape:
 
 Targeting rules:
 - Provide `ids` **or** set `all: true` — one of them is required.
-- Optionally add `source: "…"` to further restrict which items are affected.
+- Any combination of `source`/`sources`, `search`, `used`, `from`/`to`, `usedFrom`/`usedTo` further narrows the scope (they are **AND**-ed).
+- Dates accept ISO strings; plain `YYYY-MM-DD` values in `to`/`usedTo` auto-extend to end-of-day.
 
 Change the source for a set of IDs:
 ```bash
@@ -624,10 +652,12 @@ https://your-domain.com/feed
 
 - 🔍 Search + source-tab filtering + pagination
 - 🟢 **Usage filter** — All / Unused / Used chips at the top
-- ⬆️ Drag-and-drop **multi-image upload** with per-item editable title, source, and description
-- 🧰 Batch caption tools during staging (prefix/suffix titles, set description, set source for all)
+- 📅 **Date-range filter** — pick a `Stored` from/to range or use the `7d` / `30d` / `90d` / `YTD` presets
+- 🗂️ **Multi-source select** — toggle the `☐ Multi` chip (or Shift-click) to combine multiple source tabs into one view
+- 🎯 **Batch mark by filter** — one-click *Mark filter used* / *Mark filter unused* respects sources + date range + search + usage
+- ⬆️ Drag-and-drop **multi-image upload** with per-item editable title, description, and comma-separated **source(s)** — one upload fans out to multiple sources automatically
+- 🧰 Batch caption tools during staging (prefix/suffix titles, set description, set source(s) for all)
 - ✅ **Select mode** to bulk change source, edit captions, mark used/unused, or delete existing items
-- 🔁 **Per-source batch** — when a source tab is active, one-click *Mark all unused* / *Mark all used*
 - 🔑 Admin-key input (stored in `localStorage`, sent as `x-api-key`)
 
 ## �🛠 Development

@@ -48,6 +48,16 @@ function sanitizeSource(s) {
   return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
 }
 
+// Split "a,b,c" (or any separator run) into a deduped, sanitized array
+function parseSources(raw) {
+  return [...new Set(
+    String(raw || '')
+      .split(/[,\n]+/)
+      .map(sanitizeSource)
+      .filter(Boolean)
+  )];
+}
+
 function guessTitleFromFile(name) {
   return name
     .replace(/\.[^.]+$/, '')
@@ -61,7 +71,15 @@ export default function Feed() {
   const [allSources, setAllSources]   = useState([]);
   const [items, setItems]             = useState([]);
   const [pagination, setPagination]   = useState({ total: 0, pages: 1 });
-  const [activeSource, setActiveSource] = useState('all');
+
+  // Multi-source selection. Empty set = "all". "multiMode" toggles click semantics.
+  const [selectedSources, setSelectedSources] = useState(new Set());
+  const [multiMode, setMultiMode]     = useState(false);
+
+  // Date range filter (YYYY-MM-DD, empty string = no filter)
+  const [dateFrom, setDateFrom]       = useState('');
+  const [dateTo, setDateTo]           = useState('');
+
   const [usageFilter, setUsageFilter]   = useState('all'); // 'all' | 'unused' | 'used'
   const [search, setSearch]           = useState('');
   const [page, setPage]               = useState(1);
@@ -95,13 +113,16 @@ export default function Feed() {
   const fileInputRef = useRef(null);
 
   // Fetch items whenever filters change
-  const load = useCallback(async (src, q, pg, usage) => {
+  const load = useCallback(async (sources, q, pg, usage, from, to) => {
     setLoading(true);
     const p = new URLSearchParams({ limit: String(LIMIT), page: String(pg) });
-    if (src !== 'all') p.set('source', src);
-    if (q)             p.set('search', q);
+    const srcArr = sources instanceof Set ? [...sources] : (Array.isArray(sources) ? sources : []);
+    if (srcArr.length > 0) p.set('source', srcArr.join(','));
+    if (q)                 p.set('search', q);
     if (usage === 'unused') p.set('used', 'false');
     if (usage === 'used')   p.set('used', 'true');
+    if (from) p.set('from', from);
+    if (to)   p.set('to', to);
     try {
       const res  = await fetch(`/api/rss/items?${p}`);
       const data = await res.json();
@@ -124,7 +145,7 @@ export default function Feed() {
         const unique = [...new Set((data.items || []).map(i => i.source))].sort();
         setAllSources(unique);
       });
-    load('all', '', 1, 'all');
+    load(new Set(), '', 1, 'all', '', '');
   }, [load]);
 
   // Persist admin key
@@ -135,9 +156,33 @@ export default function Feed() {
     } catch {}
   }, [apiKey]);
 
-  const changeSource = (src) => { setActiveSource(src); setPage(1); load(src, search, 1, usageFilter); };
-  const changePage   = (pg)  => { setPage(pg);  load(activeSource, search, pg, usageFilter); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const changeUsage  = (u)   => { setUsageFilter(u); setPage(1); load(activeSource, search, 1, u); };
+  const toggleSource = (src) => {
+    if (src === 'all') {
+      setSelectedSources(new Set());
+      setPage(1);
+      load(new Set(), search, 1, usageFilter, dateFrom, dateTo);
+      return;
+    }
+    setSelectedSources(prev => {
+      const next = new Set(multiMode ? prev : []);
+      if (next.has(src)) next.delete(src); else next.add(src);
+      setPage(1);
+      load(next, search, 1, usageFilter, dateFrom, dateTo);
+      return next;
+    });
+  };
+
+  const clearSourceFilter = () => {
+    setSelectedSources(new Set());
+    setPage(1);
+    load(new Set(), search, 1, usageFilter, dateFrom, dateTo);
+  };
+
+  const changePage   = (pg)  => { setPage(pg);  load(selectedSources, search, pg, usageFilter, dateFrom, dateTo); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+  const changeUsage  = (u)   => { setUsageFilter(u); setPage(1); load(selectedSources, search, 1, u, dateFrom, dateTo); };
+  const changeFrom   = (v)   => { setDateFrom(v); setPage(1); load(selectedSources, search, 1, usageFilter, v, dateTo); };
+  const changeTo     = (v)   => { setDateTo(v);   setPage(1); load(selectedSources, search, 1, usageFilter, dateFrom, v); };
+  const clearDates   = ()    => { setDateFrom(''); setDateTo(''); setPage(1); load(selectedSources, search, 1, usageFilter, '', ''); };
 
   const handleSearch = (e) => {
     const q = e.target.value;
@@ -145,7 +190,7 @@ export default function Feed() {
     setPage(1);
     // Debounce
     clearTimeout(searchRef.current);
-    searchRef.current = setTimeout(() => load(activeSource, q, 1, usageFilter), 400);
+    searchRef.current = setTimeout(() => load(selectedSources, q, 1, usageFilter, dateFrom, dateTo), 400);
   };
 
   const toggle = (id) => setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
@@ -232,7 +277,7 @@ export default function Feed() {
             imageUrl: row.dataUrl,
             title: row.title.trim(),
             description: row.description.trim(),
-            source: sanitizeSource(row.source || 'uploads'),
+            sources: parseSources(row.source || 'uploads'),
           }),
         });
         if (!res.ok) {
@@ -259,7 +304,7 @@ export default function Feed() {
     }
 
     await refreshAll();
-    load(activeSource, search, 1, usageFilter);
+    load(selectedSources, search, 1, usageFilter, dateFrom, dateTo);
     setPage(1);
   };
 
@@ -299,7 +344,7 @@ export default function Feed() {
       setBatchDescription('');
       clearSelection();
       await refreshAll();
-      load(activeSource, search, page, usageFilter);
+      load(selectedSources, search, page, usageFilter, dateFrom, dateTo);
     } catch (err) {
       setBatchStatus(`Error: ${err.message}`);
     } finally {
@@ -323,7 +368,7 @@ export default function Feed() {
       setBatchStatus(`Deleted ${j.deleted} item(s).`);
       clearSelection();
       await refreshAll();
-      load(activeSource, search, page, usageFilter);
+      load(selectedSources, search, page, usageFilter, dateFrom, dateTo);
     } catch (err) {
       setBatchStatus(`Error: ${err.message}`);
     } finally {
@@ -346,7 +391,7 @@ export default function Feed() {
       if (!res.ok) throw new Error(j.error || res.statusText);
       setBatchStatus(`Marked ${j.updated} item(s) as ${used ? 'used' : 'unused'}.`);
       clearSelection();
-      load(activeSource, search, page, usageFilter);
+      load(selectedSources, search, page, usageFilter, dateFrom, dateTo);
     } catch (err) {
       setBatchStatus(`Error: ${err.message}`);
     } finally {
@@ -354,28 +399,54 @@ export default function Feed() {
     }
   };
 
-  // Mark ALL items in the currently-active source as used / unused
-  const markSourceUsed = async (used) => {
-    if (activeSource === 'all') return alert('Pick a specific source tab first.');
-    const label = used ? 'used' : 'unused';
-    if (!confirm(`Mark ALL items in "${activeSource}" as ${label}?`)) return;
+  // True when any scope filter is set (sources, date range, or usage)
+  const hasFilter = selectedSources.size > 0
+    || !!dateFrom || !!dateTo
+    || usageFilter !== 'all'
+    || !!search;
+
+  // Describe the current filter scope for confirm dialogs / status text
+  const filterDescription = () => {
+    const parts = [];
+    if (selectedSources.size > 0) parts.push(`sources: ${[...selectedSources].join(', ')}`);
+    if (dateFrom || dateTo)       parts.push(`stored ${dateFrom || '…'} → ${dateTo || '…'}`);
+    if (usageFilter !== 'all')    parts.push(`only ${usageFilter}`);
+    if (search)                   parts.push(`match "${search}"`);
+    return parts.length ? parts.join(' · ') : 'ALL items in the store';
+  };
+
+  // Mark ALL items matching the CURRENT filter (sources + date range + usage + search)
+  const markFilterUsed = async (used) => {
+    if (!hasFilter) {
+      if (!confirm('No filter set — this will mark EVERY item in the store. Continue?')) return;
+    } else if (!confirm(`Mark ALL items matching filter (${filterDescription()}) as ${used ? 'used' : 'unused'}?`)) {
+      return;
+    }
     setBatchBusy(true);
     setBatchStatus(null);
     try {
+      const payload = {
+        action: 'update',
+        all: true,
+        patch: { used },
+      };
+      if (selectedSources.size > 0) payload.sources = [...selectedSources];
+      if (search)                   payload.search  = search;
+      if (dateFrom)                 payload.from    = dateFrom;
+      if (dateTo)                   payload.to      = dateTo;
+      // Skip usage filter when marking used=X to avoid the trivial "already X → X" case
+      if (usageFilter === 'unused' && used === true)  payload.used = false;
+      if (usageFilter === 'used'   && used === false) payload.used = true;
+
       const res = await fetch('/api/rss/batch', {
         method: 'POST',
         headers: authHeaders,
-        body: JSON.stringify({
-          action: 'update',
-          all: true,
-          source: activeSource,
-          patch: { used },
-        }),
+        body: JSON.stringify(payload),
       });
       const j = await res.json();
       if (!res.ok) throw new Error(j.error || res.statusText);
-      setBatchStatus(`Marked ${j.updated} item(s) in "${activeSource}" as ${label}.`);
-      load(activeSource, search, 1, usageFilter);
+      setBatchStatus(`Marked ${j.updated} item(s) as ${used ? 'used' : 'unused'}.`);
+      load(selectedSources, search, 1, usageFilter, dateFrom, dateTo);
       setPage(1);
     } catch (err) {
       setBatchStatus(`Error: ${err.message}`);
@@ -449,7 +520,7 @@ export default function Feed() {
         </button>
       </header>
 
-      {/* ── Usage filter ── */}
+      {/* ── Usage filter + date range + batch-mark-by-filter ── */}
       <div style={{
         padding: '8px 28px', background: 'rgba(0,0,0,0.25)',
         borderBottom: '1px solid rgba(255,255,255,0.05)',
@@ -475,19 +546,60 @@ export default function Feed() {
             </button>
           );
         })}
-        {activeSource !== 'all' && (
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <span style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
-              Batch "{activeSource}":
-            </span>
-            <button onClick={() => markSourceUsed(false)} disabled={batchBusy} style={sourceBatchBtn('#10b981', batchBusy)}>
-              Mark all unused
-            </button>
-            <button onClick={() => markSourceUsed(true)} disabled={batchBusy} style={sourceBatchBtn('#f59e0b', batchBusy)}>
-              Mark all used
-            </button>
-          </div>
+
+        <span style={{ marginLeft: 8, fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+          Stored
+        </span>
+        <input
+          type="date"
+          value={dateFrom}
+          onChange={(e) => changeFrom(e.target.value)}
+          title="Stored from (inclusive)"
+          style={dateInput}
+        />
+        <span style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.4)' }}>→</span>
+        <input
+          type="date"
+          value={dateTo}
+          onChange={(e) => changeTo(e.target.value)}
+          title="Stored to (inclusive)"
+          style={dateInput}
+        />
+        {(dateFrom || dateTo) && (
+          <button onClick={clearDates} style={miniBtn} title="Clear date filter">Clear dates</button>
         )}
+        {/* Quick date-range presets */}
+        {[
+          { key: '7',   label: '7d' },
+          { key: '30',  label: '30d' },
+          { key: '90',  label: '90d' },
+          { key: 'ytd', label: 'YTD' },
+        ].map(p => (
+          <button key={p.key} onClick={() => {
+            const now = new Date();
+            let from;
+            if (p.key === 'ytd') from = new Date(now.getFullYear(), 0, 1);
+            else                 from = new Date(now.getTime() - Number(p.key) * 86400000);
+            const fromStr = from.toISOString().slice(0, 10);
+            const toStr   = now.toISOString().slice(0, 10);
+            setDateFrom(fromStr); setDateTo(toStr); setPage(1);
+            load(selectedSources, search, 1, usageFilter, fromStr, toStr);
+          }} style={{
+            ...miniBtn, padding: '4px 10px', fontSize: '0.72rem',
+          }}>{p.label}</button>
+        ))}
+
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
+            Batch filter ({pagination.total}):
+          </span>
+          <button onClick={() => markFilterUsed(false)} disabled={batchBusy} style={sourceBatchBtn('#10b981', batchBusy)}>
+            Mark filter unused
+          </button>
+          <button onClick={() => markFilterUsed(true)} disabled={batchBusy} style={sourceBatchBtn('#f59e0b', batchBusy)}>
+            Mark filter used
+          </button>
+        </div>
       </div>
 
       {showKeyInput && (
@@ -553,7 +665,7 @@ export default function Feed() {
                 display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10,
                 alignItems: 'end',
               }}>
-                <BatchField label="Set source for all" placeholder="e.g. uploads-2026"
+                <BatchField label="Set source(s) for all" placeholder="e.g. uploads, curated-2026"
                   value={batchStageSource} onChange={setBatchStageSource} />
                 <BatchField label="Prefix all titles" placeholder="🔥 "
                   value={batchPrefix} onChange={setBatchPrefix} />
@@ -590,7 +702,7 @@ export default function Feed() {
                     <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
                       <StageInput label="Title" value={row.title}
                         onChange={(v) => updateStaged(row.key, { title: v })} />
-                      <StageInput label="Source" value={row.source}
+                      <StageInput label="Source(s) — comma separated" value={row.source}
                         onChange={(v) => updateStaged(row.key, { source: v })} />
                       <StageTextarea label="Description" value={row.description}
                         onChange={(v) => updateStaged(row.key, { description: v })} />
@@ -681,28 +793,72 @@ export default function Feed() {
         </section>
       )}
 
-      {/* ── Source tabs ── */}
+      {/* ── Source tabs (multi-select capable) ── */}
       <nav style={{
         padding: '12px 28px', display: 'flex', gap: '8px', flexWrap: 'wrap',
         borderBottom: '1px solid rgba(255,255,255,0.06)',
-        background: 'rgba(0,0,0,0.3)',
+        background: 'rgba(0,0,0,0.3)', alignItems: 'center',
       }}>
+        <button
+          onClick={() => setMultiMode(v => !v)}
+          title={multiMode ? 'Click tabs to toggle selection' : 'Click tabs to switch — Shift-click still multi-selects'}
+          style={{
+            padding: '5px 13px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+            background: multiMode ? '#14b8a6' : 'rgba(255,255,255,0.07)',
+            color: multiMode ? '#fff' : 'rgba(255,255,255,0.65)',
+            fontSize: '0.72rem', fontWeight: 600,
+          }}
+        >
+          {multiMode ? '☑ Multi' : '☐ Multi'}
+        </button>
+
         {['all', ...allSources].map(src => {
-          const active = activeSource === src;
-          const color  = src === 'all' ? '#6366f1' : sourceColor(src, allSources);
+          const isAll  = src === 'all';
+          const active = isAll ? selectedSources.size === 0 : selectedSources.has(src);
+          const color  = isAll ? '#6366f1' : sourceColor(src, allSources);
           return (
-            <button key={src} onClick={() => changeSource(src)} style={{
-              padding: '5px 13px', borderRadius: '20px', border: 'none', cursor: 'pointer',
-              background: active ? color : 'rgba(255,255,255,0.07)',
-              color: active ? '#fff' : 'rgba(255,255,255,0.65)',
-              fontSize: '0.78rem', fontWeight: active ? 600 : 400,
-              boxShadow: active ? `0 0 12px ${color}55` : 'none',
-              transition: 'all 0.15s',
-            }}>
-              {src === 'all' ? 'All' : src}
+            <button
+              key={src}
+              onClick={(e) => {
+                // Shift-click always toggles (adds to multi-select); otherwise respect multiMode
+                if (isAll) return toggleSource('all');
+                if (e.shiftKey || multiMode) {
+                  setSelectedSources(prev => {
+                    const next = new Set(prev);
+                    if (next.has(src)) next.delete(src); else next.add(src);
+                    setPage(1);
+                    load(next, search, 1, usageFilter, dateFrom, dateTo);
+                    return next;
+                  });
+                } else {
+                  const next = new Set([src]);
+                  setSelectedSources(next);
+                  setPage(1);
+                  load(next, search, 1, usageFilter, dateFrom, dateTo);
+                }
+              }}
+              style={{
+                padding: '5px 13px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+                background: active ? color : 'rgba(255,255,255,0.07)',
+                color: active ? '#fff' : 'rgba(255,255,255,0.65)',
+                fontSize: '0.78rem', fontWeight: active ? 600 : 400,
+                boxShadow: active ? `0 0 12px ${color}55` : 'none',
+                transition: 'all 0.15s',
+              }}
+            >
+              {isAll ? 'All' : src}
             </button>
           );
         })}
+
+        {selectedSources.size > 0 && (
+          <span style={{ marginLeft: 'auto', fontSize: '0.72rem', color: 'rgba(255,255,255,0.55)' }}>
+            {selectedSources.size} source{selectedSources.size === 1 ? '' : 's'} selected
+            <button onClick={clearSourceFilter} style={{
+              marginLeft: 8, ...miniBtn, padding: '4px 10px', fontSize: '0.7rem',
+            }}>Clear</button>
+          </span>
+        )}
       </nav>
 
       {/* ── Grid ── */}
@@ -947,6 +1103,13 @@ function StageTextarea({ label, value, onChange }) {
 const miniBtn = {
   padding: '6px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.14)',
   background: 'rgba(255,255,255,0.06)', color: '#fff', fontSize: '0.78rem', cursor: 'pointer',
+};
+
+const dateInput = {
+  padding: '5px 8px', borderRadius: 6,
+  background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.14)',
+  color: '#fff', fontSize: '0.78rem', outline: 'none',
+  colorScheme: 'dark',
 };
 
 function sourceBatchBtn(color, busy) {

@@ -23,17 +23,25 @@ function validateImageUrl(u) {
   try { new URL(u); return true; } catch { return false; }
 }
 
-// Build and persist one item; returns the saved item object
-async function storeOne({ imageUrl, title, description = '', source = 'default' }) {
-  if (!validateImageUrl(imageUrl)) {
-    throw new Error('Invalid imageUrl');
-  }
-  const safeSrc = source.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
+const sanitizeSource = (s) =>
+  String(s || '').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase().slice(0, 64);
+
+// Accept `sources: []`, comma-separated `source: "a,b"`, or single string.
+function normalizeSources(entry) {
+  const raw = Array.isArray(entry.sources) && entry.sources.length
+    ? entry.sources
+    : String(entry.source ?? 'default').split(',');
+  const cleaned = [...new Set(raw.map(sanitizeSource).filter(Boolean))];
+  return cleaned.length ? cleaned : ['default'];
+}
+
+// Build and persist ONE item (single source); returns the saved item object
+async function storeOneForSource({ imageUrl, title, description = '', source }) {
   const id = crypto.randomUUID();
-  const storedImageUrl = await storeImage(imageUrl, safeSrc, id);
+  const storedImageUrl = await storeImage(imageUrl, source, id);
   return {
     id,
-    source: safeSrc,
+    source,
     title: title.trim().slice(0, 1000),
     description: description.trim().slice(0, 20000),
     imageUrl: storedImageUrl || (isDataUrl(imageUrl) ? null : imageUrl),
@@ -42,6 +50,22 @@ async function storeOne({ imageUrl, title, description = '', source = 'default' 
     used: false,
     usedAt: null,
   };
+}
+
+// Fan an input entry out to one saved item per source
+async function storeEntry(entry) {
+  if (!validateImageUrl(entry.imageUrl)) throw new Error('Invalid imageUrl');
+  const sources = normalizeSources(entry);
+  return Promise.all(
+    sources.map((source) =>
+      storeOneForSource({
+        imageUrl: entry.imageUrl,
+        title: entry.title,
+        description: entry.description,
+        source,
+      })
+    )
+  );
 }
 
 export default async function handler(req, res) {
@@ -58,7 +82,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, total: items.length, items });
     }
 
-    // ── POST: store one item or a batch ────────────────────────────────────
+    // ── POST: store one item or a batch (each can fan out to multiple sources) ─
     if (req.method === 'POST') {
       if (!isAuthorized(req)) {
         return res.status(401).json({ error: 'Unauthorized. Provide x-api-key header.' });
@@ -84,7 +108,7 @@ export default async function handler(req, res) {
           return res.status(400).json({
             error: `Item at index ${i} is missing required fields`,
             required: ['imageUrl', 'title'],
-            optional: ['description', 'source'],
+            optional: ['description', 'source', 'sources'],
           });
         }
         if (!validateImageUrl(entry.imageUrl)) {
@@ -92,8 +116,9 @@ export default async function handler(req, res) {
         }
       }
 
-      // Build all items (image uploads run in parallel per batch)
-      const newItems = await Promise.all(inputs.map(storeOne));
+      // Build all items; each entry may fan out to N items (one per source)
+      const nestedItems = await Promise.all(inputs.map(storeEntry));
+      const newItems = nestedItems.flat();
 
       // Prepend newest items first
       const existing = await readIndex();
