@@ -101,6 +101,9 @@ export default function Feed() {
   const [batchBusy, setBatchBusy]           = useState(false);
   const [batchStatus, setBatchStatus]       = useState(null);
 
+  // Per-item used/unused toggle (holds the id of the item currently being flipped)
+  const [busyItem, setBusyItem]             = useState(null);
+
   // Upload staging
   const [uploadOpen, setUploadOpen]     = useState(false);
   const [staged, setStaged]             = useState([]);
@@ -396,6 +399,40 @@ export default function Feed() {
       setBatchStatus(`Error: ${err.message}`);
     } finally {
       setBatchBusy(false);
+    }
+  };
+
+  // Flip a single item's used state via PATCH /api/rss/item/[id]
+  const toggleItemUsed = async (item) => {
+    if (busyItem) return;
+    const nextUsed = !item.used;
+    setBusyItem(item.id);
+    // Optimistic UI: update the card immediately, roll back on failure
+    const prevItems = items;
+    setItems(prev => prev.map(i =>
+      i.id === item.id
+        ? { ...i, used: nextUsed, usedAt: nextUsed ? new Date().toISOString() : null }
+        : i
+    ));
+    try {
+      const res = await fetch(`/api/rss/item/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH',
+        headers: authHeaders,
+        body: JSON.stringify({ used: nextUsed }),
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      // Reconcile with server response (authoritative usedAt)
+      setItems(prev => prev.map(i => i.id === item.id ? j.item : i));
+      // If the flip pushes the item out of the current usage filter, refresh
+      if ((usageFilter === 'unused' && j.item.used) || (usageFilter === 'used' && !j.item.used)) {
+        load(selectedSources, search, page, usageFilter, dateFrom, dateTo);
+      }
+    } catch (err) {
+      setItems(prevItems);
+      alert(`Failed to update: ${err.message}`);
+    } finally {
+      setBusyItem(null);
     }
   };
 
@@ -920,16 +957,28 @@ export default function Feed() {
                     }}>
                       {item.source}
                     </span>
-                    {isUsed && !selectMode && (
-                      <span title={item.usedAt ? `Used at ${item.usedAt}` : 'Used'} style={{
-                        position: 'absolute', top: 9, right: 9,
-                        background: 'rgba(0,0,0,0.75)', color: '#f59e0b',
-                        padding: '3px 9px', borderRadius: '10px',
-                        fontSize: '0.66rem', fontWeight: 700, letterSpacing: '0.04em',
-                        border: '1px solid rgba(245,158,11,0.4)',
-                      }}>
-                        ✓ USED
-                      </span>
+                    {!selectMode && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); toggleItemUsed(item); }}
+                        disabled={busyItem === item.id}
+                        title={
+                          isUsed
+                            ? (item.usedAt ? `Used at ${item.usedAt} — click to mark unused` : 'Click to mark unused')
+                            : 'Click to mark used'
+                        }
+                        style={{
+                          position: 'absolute', top: 9, right: 9,
+                          background: isUsed ? 'rgba(0,0,0,0.75)' : 'rgba(0,0,0,0.55)',
+                          color: isUsed ? '#f59e0b' : 'rgba(255,255,255,0.85)',
+                          padding: '3px 9px', borderRadius: '10px',
+                          fontSize: '0.66rem', fontWeight: 700, letterSpacing: '0.04em',
+                          border: `1px solid ${isUsed ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.18)'}`,
+                          cursor: busyItem === item.id ? 'wait' : 'pointer',
+                          opacity: busyItem === item.id ? 0.6 : 1,
+                        }}
+                      >
+                        {busyItem === item.id ? '…' : isUsed ? '✓ USED' : '○ Unused'}
+                      </button>
                     )}
                     {selectMode && (
                       <label style={{
