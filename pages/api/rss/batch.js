@@ -16,7 +16,7 @@ const sanitizeSource = (s) =>
 function parseList(value) {
   if (value == null) return [];
   const arr = Array.isArray(value) ? value : String(value).split(',');
-  return [...new Set(arr.map((s) => String(s).trim()).filter(Boolean))];
+  return [...new Set(arr.map((s) => String(s).trim().toLowerCase()).filter(Boolean))];
 }
 
 function parseDate(value) {
@@ -142,7 +142,7 @@ export default async function handler(req, res) {
   const matches = (item) => {
     if (idSet && !idSet.has(item.id)) return false;
     if (!idSet && !all) return false;
-    if (sourceSet.size > 0 && !sourceSet.has(item.source)) return false;
+    if (sourceSet.size > 0 && !sourceSet.has(String(item.source || '').toLowerCase())) return false;
     if (typeof usedFilter === 'boolean' && !!item.used !== usedFilter) return false;
     if (q) {
       const hay = `${item.title || ''}\n${item.description || ''}`.toLowerCase();

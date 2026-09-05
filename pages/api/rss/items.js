@@ -1,10 +1,10 @@
 import { readIndex, writeIndex } from '../../../lib/rssStore';
 
-// Split "a,b,c" or repeated params into a deduped array of trimmed values
+// Split "a,b,c" or repeated params into a deduped, lowercased array of trimmed values
 function parseList(value) {
   if (value == null) return [];
   const arr = Array.isArray(value) ? value : String(value).split(',');
-  return [...new Set(arr.map((s) => String(s).trim()).filter(Boolean))];
+  return [...new Set(arr.map((s) => String(s).trim().toLowerCase()).filter(Boolean))];
 }
 
 // Parse an ISO/date string into an epoch ms; returns null on failure
@@ -50,7 +50,7 @@ export default async function handler(req, res) {
   const sourceList = parseList(sources ?? source);
   if (sourceList.length > 0) {
     const set = new Set(sourceList);
-    items = items.filter((item) => set.has(item.source));
+    items = items.filter((item) => set.has(String(item.source || '').toLowerCase()));
   }
 
   if (search) {
