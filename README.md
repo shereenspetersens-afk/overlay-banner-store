@@ -368,7 +368,232 @@ The API supports multiple response types:
 - **JSON Metadata**: Complete image information with base64 data
 - **Interactive Preview**: HTML interface with download options
 
-## 🛠 Development
+## � RSS Feed Store
+
+Persistent image feed backed by Vercel Blob. Items are stored as a single JSON index; images are re-hosted under `resources/<source>/`. Visit **`/feed`** for the interactive viewer with multi-image upload, per-item and batch caption editing, and source management.
+
+### 🔐 Authentication
+
+Write operations (`POST` / `PATCH` / `DELETE`) require the `x-api-key` header (or `?secret=…` query) matching the `RSS_STORE_SECRET` environment variable. Read operations (`GET`) are always open.
+
+```bash
+export RSS_KEY="your-secret-here"
+```
+
+### 📇 Endpoints Overview
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET`    | `/api/rss/items` | List / filter / search / paginate items |
+| `GET`    | `/api/rss/store` | Return all stored items (unpaginated) |
+| `GET`    | `/api/rss/item/[id]` | Get a single item |
+| `POST`   | `/api/rss/store` | Store one or many items (image URL or base64 data URL) |
+| `PATCH`  | `/api/rss/item/[id]` | Update `title`, `description`, or `source` on one item |
+| `DELETE` | `/api/rss/item/[id]` | Delete one item and its stored image |
+| `POST`   | `/api/rss/batch` | Bulk update or delete many items in one call |
+
+### 📥 GET `/api/rss/items` — list the feed
+
+Query parameters (all optional):
+
+| Param    | Description                                          | Default |
+|----------|------------------------------------------------------|---------|
+| `source` | Filter by source name (exact match, e.g. `uploads`)  | —       |
+| `search` | Full-text search across `title` + `description`      | —       |
+| `limit`  | Items per page (1–100)                               | `20`    |
+| `page`   | Page number (1-indexed)                              | `1`     |
+
+```bash
+# All items, first 20
+curl "https://your-domain.com/api/rss/items"
+
+# Filter by source
+curl "https://your-domain.com/api/rss/items?source=uploads"
+
+# Full-text search
+curl "https://your-domain.com/api/rss/items?search=sunset"
+
+# Paginate
+curl "https://your-domain.com/api/rss/items?limit=50&page=2"
+
+# Combined
+curl "https://your-domain.com/api/rss/items?source=uploads&search=2026&limit=24&page=1"
+```
+
+```javascript
+// Fetch a filtered page
+const params = new URLSearchParams({ source: 'uploads', limit: '24', page: '1' });
+const data = await fetch(`/api/rss/items?${params}`).then(r => r.json());
+console.log(data.pagination); // { total, page, limit, pages }
+console.log(data.items);      // array of items
+
+// Derive the unique source list (there is no dedicated /sources endpoint)
+const all = await fetch('/api/rss/items?limit=100').then(r => r.json());
+const sources = [...new Set(all.items.map(i => i.source))].sort();
+```
+
+Response shape:
+```json
+{
+  "items": [
+    {
+      "id": "9d1a2c-…",
+      "source": "uploads",
+      "title": "Amazing sunset",
+      "description": "**Location:** Manila Bay",
+      "imageUrl": "https://…blob.vercel-storage.com/resources/uploads/9d1a2c-….jpg",
+      "originalImageUrl": "https://picsum.photos/800/600",
+      "storedAt": "2026-09-05T04:22:08.479Z"
+    }
+  ],
+  "pagination": { "total": 42, "page": 1, "limit": 20, "pages": 3 }
+}
+```
+
+### 📥 GET `/api/rss/item/[id]` — get one item
+
+```bash
+curl "https://your-domain.com/api/rss/item/9d1a2c-…"
+```
+
+### 📤 POST `/api/rss/store` — create one or many
+
+Accepts a single object **or** an array. `imageUrl` may be an `http(s)://…` URL **or** a `data:image/…;base64,…` data URL (used by the `/feed` upload UI).
+
+Single item, remote URL:
+```bash
+curl -X POST "https://your-domain.com/api/rss/store" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{
+    "imageUrl": "https://picsum.photos/800/600",
+    "title": "Amazing sunset",
+    "description": "**Location:** Manila Bay",
+    "source": "uploads"
+  }'
+```
+
+Batch (array):
+```bash
+curl -X POST "https://your-domain.com/api/rss/store" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '[
+    { "imageUrl": "https://picsum.photos/800/600?a", "title": "One",   "source": "uploads" },
+    { "imageUrl": "https://picsum.photos/800/600?b", "title": "Two",   "source": "uploads" },
+    { "imageUrl": "https://picsum.photos/800/600?c", "title": "Three", "source": "uploads" }
+  ]'
+```
+
+Data URL upload (base64 image inline):
+```javascript
+const file = document.querySelector('input[type=file]').files[0];
+const dataUrl = await new Promise((res) => {
+  const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file);
+});
+await fetch('/api/rss/store', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'x-api-key': RSS_KEY },
+  body: JSON.stringify({
+    imageUrl: dataUrl,               // data:image/png;base64,…
+    title: 'Uploaded from browser',
+    description: '',
+    source: 'uploads',
+  }),
+});
+```
+
+### ✏️ PATCH `/api/rss/item/[id]` — edit one item
+
+Any of `title`, `description`, `source` may be provided; omitted fields are left unchanged.
+
+```bash
+curl -X PATCH "https://your-domain.com/api/rss/item/9d1a2c-…" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{ "title": "New title", "description": "New description", "source": "curated" }'
+```
+
+### 🔁 POST `/api/rss/batch` — bulk update or delete
+
+Body shape:
+```json
+{
+  "action": "update",
+  "ids": ["id1", "id2"],
+  "all": false,
+  "source": "optional-source-filter",
+  "patch": {
+    "source": "new-source",
+    "title": "overwrite title",
+    "titlePrefix": "🔥 ",
+    "titleSuffix": " (updated)",
+    "titleReplace": { "find": "foo", "replace": "bar", "flags": "gi" },
+    "description": "overwrite description",
+    "descriptionPrefix": "…",
+    "descriptionSuffix": "…",
+    "descriptionReplace": { "find": "\\bTOS\\b", "replace": "Terms", "flags": "g" }
+  }
+}
+```
+
+Targeting rules:
+- Provide `ids` **or** set `all: true` — one of them is required.
+- Optionally add `source: "…"` to further restrict which items are affected.
+
+Change the source for a set of IDs:
+```bash
+curl -X POST "https://your-domain.com/api/rss/batch" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{
+    "action": "update",
+    "ids": ["id-1", "id-2", "id-3"],
+    "patch": { "source": "curated-2026" }
+  }'
+```
+
+Prefix every title from a given source:
+```bash
+curl -X POST "https://your-domain.com/api/rss/batch" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{
+    "action": "update",
+    "all": true,
+    "source": "uploads",
+    "patch": { "titlePrefix": "🔥 " }
+  }'
+```
+
+Delete many at once:
+```bash
+curl -X POST "https://your-domain.com/api/rss/batch" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{ "action": "delete", "ids": ["id-1", "id-2"] }'
+```
+
+### 🗑️ DELETE `/api/rss/item/[id]` — delete one item
+
+```bash
+curl -X DELETE "https://your-domain.com/api/rss/item/9d1a2c-…" \
+  -H "x-api-key: $RSS_KEY"
+```
+
+### 🖥️ Interactive Viewer — `/feed`
+
+```
+https://your-domain.com/feed
+```
+
+- 🔍 Search + source-tab filtering + pagination
+- ⬆️ Drag-and-drop **multi-image upload** with per-item editable title, source, and description
+- 🧰 Batch caption tools during staging (prefix/suffix titles, set description, set source for all)
+- ✅ **Select mode** to bulk change source, edit captions, or delete existing items
+- 🔑 Admin-key input (stored in `localStorage`, sent as `x-api-key`)
+
+## �🛠 Development
 
 1. Install dependencies:
 ```bash
