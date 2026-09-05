@@ -59,6 +59,10 @@ export default async function handler(req, res) {
     if (typeof body.source === 'string' && body.source.trim()) {
       updated.source = sanitizeSource(body.source);
     }
+    if (typeof body.used === 'boolean') {
+      updated.used   = body.used;
+      updated.usedAt = body.used ? new Date().toISOString() : null;
+    }
 
     items[itemIndex] = updated;
     await writeIndex(items);

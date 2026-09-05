@@ -39,6 +39,8 @@ async function storeOne({ imageUrl, title, description = '', source = 'default' 
     imageUrl: storedImageUrl || (isDataUrl(imageUrl) ? null : imageUrl),
     originalImageUrl: isDataUrl(imageUrl) ? null : imageUrl,
     storedAt: new Date().toISOString(),
+    used: false,
+    usedAt: null,
   };
 }
 

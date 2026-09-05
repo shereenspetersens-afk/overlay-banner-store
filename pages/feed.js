@@ -62,6 +62,7 @@ export default function Feed() {
   const [items, setItems]             = useState([]);
   const [pagination, setPagination]   = useState({ total: 0, pages: 1 });
   const [activeSource, setActiveSource] = useState('all');
+  const [usageFilter, setUsageFilter]   = useState('all'); // 'all' | 'unused' | 'used'
   const [search, setSearch]           = useState('');
   const [page, setPage]               = useState(1);
   const [loading, setLoading]         = useState(true);
@@ -94,11 +95,13 @@ export default function Feed() {
   const fileInputRef = useRef(null);
 
   // Fetch items whenever filters change
-  const load = useCallback(async (src, q, pg) => {
+  const load = useCallback(async (src, q, pg, usage) => {
     setLoading(true);
     const p = new URLSearchParams({ limit: String(LIMIT), page: String(pg) });
     if (src !== 'all') p.set('source', src);
     if (q)             p.set('search', q);
+    if (usage === 'unused') p.set('used', 'false');
+    if (usage === 'used')   p.set('used', 'true');
     try {
       const res  = await fetch(`/api/rss/items?${p}`);
       const data = await res.json();
@@ -121,7 +124,7 @@ export default function Feed() {
         const unique = [...new Set((data.items || []).map(i => i.source))].sort();
         setAllSources(unique);
       });
-    load('all', '', 1);
+    load('all', '', 1, 'all');
   }, [load]);
 
   // Persist admin key
@@ -132,8 +135,9 @@ export default function Feed() {
     } catch {}
   }, [apiKey]);
 
-  const changeSource = (src) => { setActiveSource(src); setPage(1); load(src, search, 1); };
-  const changePage   = (pg)  => { setPage(pg);  load(activeSource, search, pg); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+  const changeSource = (src) => { setActiveSource(src); setPage(1); load(src, search, 1, usageFilter); };
+  const changePage   = (pg)  => { setPage(pg);  load(activeSource, search, pg, usageFilter); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+  const changeUsage  = (u)   => { setUsageFilter(u); setPage(1); load(activeSource, search, 1, u); };
 
   const handleSearch = (e) => {
     const q = e.target.value;
@@ -141,7 +145,7 @@ export default function Feed() {
     setPage(1);
     // Debounce
     clearTimeout(searchRef.current);
-    searchRef.current = setTimeout(() => load(activeSource, q, 1), 400);
+    searchRef.current = setTimeout(() => load(activeSource, q, 1, usageFilter), 400);
   };
 
   const toggle = (id) => setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
@@ -255,7 +259,7 @@ export default function Feed() {
     }
 
     await refreshAll();
-    load(activeSource, search, 1);
+    load(activeSource, search, 1, usageFilter);
     setPage(1);
   };
 
@@ -295,7 +299,7 @@ export default function Feed() {
       setBatchDescription('');
       clearSelection();
       await refreshAll();
-      load(activeSource, search, page);
+      load(activeSource, search, page, usageFilter);
     } catch (err) {
       setBatchStatus(`Error: ${err.message}`);
     } finally {
@@ -319,7 +323,60 @@ export default function Feed() {
       setBatchStatus(`Deleted ${j.deleted} item(s).`);
       clearSelection();
       await refreshAll();
-      load(activeSource, search, page);
+      load(activeSource, search, page, usageFilter);
+    } catch (err) {
+      setBatchStatus(`Error: ${err.message}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  // Mark selected items used / unused
+  const markSelectedUsed = async (used) => {
+    if (selected.size === 0) return alert('Select at least one item first.');
+    setBatchBusy(true);
+    setBatchStatus(null);
+    try {
+      const res = await fetch('/api/rss/batch', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ action: 'update', ids: [...selected], patch: { used } }),
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      setBatchStatus(`Marked ${j.updated} item(s) as ${used ? 'used' : 'unused'}.`);
+      clearSelection();
+      load(activeSource, search, page, usageFilter);
+    } catch (err) {
+      setBatchStatus(`Error: ${err.message}`);
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  // Mark ALL items in the currently-active source as used / unused
+  const markSourceUsed = async (used) => {
+    if (activeSource === 'all') return alert('Pick a specific source tab first.');
+    const label = used ? 'used' : 'unused';
+    if (!confirm(`Mark ALL items in "${activeSource}" as ${label}?`)) return;
+    setBatchBusy(true);
+    setBatchStatus(null);
+    try {
+      const res = await fetch('/api/rss/batch', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          action: 'update',
+          all: true,
+          source: activeSource,
+          patch: { used },
+        }),
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j.error || res.statusText);
+      setBatchStatus(`Marked ${j.updated} item(s) in "${activeSource}" as ${label}.`);
+      load(activeSource, search, 1, usageFilter);
+      setPage(1);
     } catch (err) {
       setBatchStatus(`Error: ${err.message}`);
     } finally {
@@ -391,6 +448,47 @@ export default function Feed() {
           🔑 {apiKey ? 'Key set' : 'Set key'}
         </button>
       </header>
+
+      {/* ── Usage filter ── */}
+      <div style={{
+        padding: '8px 28px', background: 'rgba(0,0,0,0.25)',
+        borderBottom: '1px solid rgba(255,255,255,0.05)',
+        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+      }}>
+        <span style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+          Show
+        </span>
+        {[
+          { key: 'all',    label: 'All' },
+          { key: 'unused', label: 'Unused' },
+          { key: 'used',   label: 'Used' },
+        ].map(opt => {
+          const active = usageFilter === opt.key;
+          return (
+            <button key={opt.key} onClick={() => changeUsage(opt.key)} style={{
+              padding: '4px 12px', borderRadius: 14, border: 'none', cursor: 'pointer',
+              background: active ? '#10b981' : 'rgba(255,255,255,0.07)',
+              color: active ? '#fff' : 'rgba(255,255,255,0.65)',
+              fontSize: '0.75rem', fontWeight: active ? 600 : 400,
+            }}>
+              {opt.label}
+            </button>
+          );
+        })}
+        {activeSource !== 'all' && (
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.72rem', color: 'rgba(255,255,255,0.5)' }}>
+              Batch "{activeSource}":
+            </span>
+            <button onClick={() => markSourceUsed(false)} disabled={batchBusy} style={sourceBatchBtn('#10b981', batchBusy)}>
+              Mark all unused
+            </button>
+            <button onClick={() => markSourceUsed(true)} disabled={batchBusy} style={sourceBatchBtn('#f59e0b', batchBusy)}>
+              Mark all used
+            </button>
+          </div>
+        )}
+      </div>
 
       {showKeyInput && (
         <div style={{
@@ -543,6 +641,14 @@ export default function Feed() {
             </strong>
             <button onClick={selectAllOnPage} style={miniBtn}>Select page</button>
             <button onClick={clearSelection} style={miniBtn}>Clear</button>
+            <button onClick={() => markSelectedUsed(false)} disabled={batchBusy || selected.size === 0} style={{
+              ...miniBtn, background: '#10b981', borderColor: '#10b981',
+              opacity: batchBusy || selected.size === 0 ? 0.5 : 1,
+            }}>Mark unused</button>
+            <button onClick={() => markSelectedUsed(true)} disabled={batchBusy || selected.size === 0} style={{
+              ...miniBtn, background: '#f59e0b', borderColor: '#f59e0b',
+              opacity: batchBusy || selected.size === 0 ? 0.5 : 1,
+            }}>Mark used</button>
             <button onClick={deleteSelected} disabled={batchBusy || selected.size === 0} style={{
               ...miniBtn, background: '#ef4444', borderColor: '#ef4444',
               opacity: batchBusy || selected.size === 0 ? 0.5 : 1,
@@ -620,6 +726,7 @@ export default function Feed() {
               const color = sourceColor(item.source, allSources);
               const isExpanded = !!expanded[item.id];
               const isChecked  = selected.has(item.id);
+              const isUsed     = !!item.used;
               const preview = item.description
                 ? item.description.replace(/\*\*/g, '').slice(0, 110) + (item.description.length > 110 ? '…' : '')
                 : '';
@@ -630,8 +737,9 @@ export default function Feed() {
                   border: `1px solid ${isChecked ? '#8b5cf6' : 'rgba(255,255,255,0.09)'}`,
                   borderRadius: '12px', overflow: 'hidden',
                   display: 'flex', flexDirection: 'column',
-                  transition: 'border-color 0.2s, box-shadow 0.2s',
+                  transition: 'border-color 0.2s, box-shadow 0.2s, opacity 0.2s',
                   boxShadow: isChecked ? '0 0 0 2px rgba(139,92,246,0.4)' : 'none',
+                  opacity: isUsed && !isChecked ? 0.55 : 1,
                 }}
                   onMouseEnter={e => { if (!isChecked) { e.currentTarget.style.borderColor = `${color}66`; e.currentTarget.style.boxShadow = `0 4px 24px rgba(0,0,0,0.4)`; } }}
                   onMouseLeave={e => { if (!isChecked) { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.09)'; e.currentTarget.style.boxShadow = 'none'; } }}
@@ -656,6 +764,17 @@ export default function Feed() {
                     }}>
                       {item.source}
                     </span>
+                    {isUsed && !selectMode && (
+                      <span title={item.usedAt ? `Used at ${item.usedAt}` : 'Used'} style={{
+                        position: 'absolute', top: 9, right: 9,
+                        background: 'rgba(0,0,0,0.75)', color: '#f59e0b',
+                        padding: '3px 9px', borderRadius: '10px',
+                        fontSize: '0.66rem', fontWeight: 700, letterSpacing: '0.04em',
+                        border: '1px solid rgba(245,158,11,0.4)',
+                      }}>
+                        ✓ USED
+                      </span>
+                    )}
                     {selectMode && (
                       <label style={{
                         position: 'absolute', top: 9, right: 9,
@@ -829,3 +948,11 @@ const miniBtn = {
   padding: '6px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.14)',
   background: 'rgba(255,255,255,0.06)', color: '#fff', fontSize: '0.78rem', cursor: 'pointer',
 };
+
+function sourceBatchBtn(color, busy) {
+  return {
+    padding: '5px 11px', borderRadius: 14, border: 'none', cursor: busy ? 'not-allowed' : 'pointer',
+    background: color, color: '#fff', fontSize: '0.72rem', fontWeight: 600,
+    opacity: busy ? 0.6 : 1,
+  };
+}

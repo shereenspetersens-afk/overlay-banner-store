@@ -396,12 +396,14 @@ export RSS_KEY="your-secret-here"
 
 Query parameters (all optional):
 
-| Param    | Description                                          | Default |
-|----------|------------------------------------------------------|---------|
-| `source` | Filter by source name (exact match, e.g. `uploads`)  | —       |
-| `search` | Full-text search across `title` + `description`      | —       |
-| `limit`  | Items per page (1–100)                               | `20`    |
-| `page`   | Page number (1-indexed)                              | `1`     |
+| Param      | Description                                                  | Default |
+|------------|--------------------------------------------------------------|---------|
+| `source`   | Filter by source name (exact match, e.g. `uploads`)          | —       |
+| `search`   | Full-text search across `title` + `description`              | —       |
+| `used`     | `false` → unused only, `true` → used only                    | —       |
+| `limit`    | Items per page (1–100)                                       | `20`    |
+| `page`     | Page number (1-indexed)                                      | `1`     |
+| `markUsed` | `true` → also flip returned items to `used=true` (write op). Requires `x-api-key` when `RSS_STORE_SECRET` is set. | —       |
 
 ```bash
 # All items, first 20
@@ -409,6 +411,13 @@ curl "https://your-domain.com/api/rss/items"
 
 # Filter by source
 curl "https://your-domain.com/api/rss/items?source=uploads"
+
+# Only unused items (avoid duplicates)
+curl "https://your-domain.com/api/rss/items?used=false"
+
+# Atomic "pop" — retrieve 10 unused items and mark them used in one call
+curl "https://your-domain.com/api/rss/items?used=false&limit=10&markUsed=true" \
+  -H "x-api-key: $RSS_KEY"
 
 # Full-text search
 curl "https://your-domain.com/api/rss/items?search=sunset"
@@ -443,12 +452,16 @@ Response shape:
       "description": "**Location:** Manila Bay",
       "imageUrl": "https://…blob.vercel-storage.com/resources/uploads/9d1a2c-….jpg",
       "originalImageUrl": "https://picsum.photos/800/600",
-      "storedAt": "2026-09-05T04:22:08.479Z"
+      "storedAt": "2026-09-05T04:22:08.479Z",
+      "used": false,
+      "usedAt": null
     }
   ],
   "pagination": { "total": 42, "page": 1, "limit": 20, "pages": 3 }
 }
 ```
+
+> **Item lifecycle:** every item has a boolean `used` flag (default `false`) and a `usedAt` ISO timestamp. Consumers should either query with `?used=false` and later flip items via `POST /api/rss/batch` **or** use `?used=false&markUsed=true` for atomic "take next unused" semantics — this prevents duplicate retrieval.
 
 ### 📥 GET `/api/rss/item/[id]` — get one item
 
@@ -505,13 +518,13 @@ await fetch('/api/rss/store', {
 
 ### ✏️ PATCH `/api/rss/item/[id]` — edit one item
 
-Any of `title`, `description`, `source` may be provided; omitted fields are left unchanged.
+Any of `title`, `description`, `source`, `used` may be provided; omitted fields are left unchanged. Setting `used: true` also stamps `usedAt` to the current ISO time; `used: false` clears it.
 
 ```bash
 curl -X PATCH "https://your-domain.com/api/rss/item/9d1a2c-…" \
   -H "Content-Type: application/json" \
   -H "x-api-key: $RSS_KEY" \
-  -d '{ "title": "New title", "description": "New description", "source": "curated" }'
+  -d '{ "title": "New title", "description": "New description", "source": "curated", "used": true }'
 ```
 
 ### 🔁 POST `/api/rss/batch` — bulk update or delete
@@ -525,6 +538,7 @@ Body shape:
   "source": "optional-source-filter",
   "patch": {
     "source": "new-source",
+    "used": true,
     "title": "overwrite title",
     "titlePrefix": "🔥 ",
     "titleSuffix": " (updated)",
@@ -574,6 +588,27 @@ curl -X POST "https://your-domain.com/api/rss/batch" \
   -d '{ "action": "delete", "ids": ["id-1", "id-2"] }'
 ```
 
+Reset an entire source back to unused (e.g. to re-queue a feed):
+```bash
+curl -X POST "https://your-domain.com/api/rss/batch" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{
+    "action": "update",
+    "all": true,
+    "source": "uploads",
+    "patch": { "used": false }
+  }'
+```
+
+Mark specific IDs as used after consuming them:
+```bash
+curl -X POST "https://your-domain.com/api/rss/batch" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $RSS_KEY" \
+  -d '{ "action": "update", "ids": ["id-1", "id-2"], "patch": { "used": true } }'
+```
+
 ### 🗑️ DELETE `/api/rss/item/[id]` — delete one item
 
 ```bash
@@ -588,9 +623,11 @@ https://your-domain.com/feed
 ```
 
 - 🔍 Search + source-tab filtering + pagination
+- 🟢 **Usage filter** — All / Unused / Used chips at the top
 - ⬆️ Drag-and-drop **multi-image upload** with per-item editable title, source, and description
 - 🧰 Batch caption tools during staging (prefix/suffix titles, set description, set source for all)
-- ✅ **Select mode** to bulk change source, edit captions, or delete existing items
+- ✅ **Select mode** to bulk change source, edit captions, mark used/unused, or delete existing items
+- 🔁 **Per-source batch** — when a source tab is active, one-click *Mark all unused* / *Mark all used*
 - 🔑 Admin-key input (stored in `localStorage`, sent as `x-api-key`)
 
 ## �🛠 Development

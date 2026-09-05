@@ -33,6 +33,11 @@ function applyPatch(item, patch) {
     next.source = sanitizeSource(patch.source);
   }
 
+  if (typeof patch.used === 'boolean') {
+    next.used   = patch.used;
+    next.usedAt = patch.used ? new Date().toISOString() : null;
+  }
+
   let title = next.title || '';
   if (typeof patch.title === 'string')       title = patch.title;
   if (patch.titleReplace && patch.titleReplace.find != null) {
